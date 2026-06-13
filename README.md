@@ -1,6 +1,6 @@
 <div align="center">
 
-![TheOrc Companion Banner](assets/companion-banner.svg)
+![TheOrc Companion App Icon](assets/02_app_icon.png)
 
 [![Platform](https://img.shields.io/badge/platform-Android%20%2B%20Web-21C55D?style=for-the-badge)](#quick-start)
 [![React](https://img.shields.io/badge/React-19-111827?style=for-the-badge&logo=react)](#quick-start)
