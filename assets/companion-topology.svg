@@ -1,0 +1,76 @@
+<svg width="1400" height="520" viewBox="0 0 1400 520" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1400" y2="520" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#041018"/>
+      <stop offset="1" stop-color="#02060B"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ADFF60"/>
+      <stop offset="1" stop-color="#1ADE78"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1400" height="520" rx="28" fill="url(#bg)"/>
+
+  <g opacity="0.7" stroke="#2DF36E" stroke-width="4" stroke-linecap="round">
+    <path d="M252 260H520"/>
+    <path d="M700 150V104"/>
+    <path d="M700 370V416"/>
+    <path d="M880 260H1148"/>
+    <path d="M892 208L1014 136"/>
+    <path d="M892 312L1014 384"/>
+    <path d="M508 208L386 136"/>
+    <path d="M508 312L386 384"/>
+  </g>
+
+  <g>
+    <rect x="76" y="190" width="176" height="140" rx="28" fill="#071118" stroke="#31F671" stroke-width="6"/>
+    <text x="164" y="236" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="700">TheOrc</text>
+    <text x="164" y="278" text-anchor="middle" fill="#72FF57" font-family="Consolas, 'Courier New', monospace" font-size="20">Boss Node</text>
+    <text x="164" y="308" text-anchor="middle" fill="#8B94A8" font-family="Segoe UI, Arial, sans-serif" font-size="18">Plans work</text>
+  </g>
+
+  <g>
+    <path d="M700 88L848 148L908 260L848 372L700 432L552 372L492 260L552 148L700 88Z" fill="#08131A" stroke="url(#green)" stroke-width="8"/>
+    <rect x="620" y="148" width="160" height="224" rx="34" fill="#09161E" stroke="#D6FFE4" stroke-opacity="0.35" stroke-width="4"/>
+    <rect x="664" y="124" width="72" height="14" rx="7" fill="#54FA55"/>
+    <path d="M680 220L642 262V324L682 360H718L758 324V262L720 220H680Z" fill="url(#green)"/>
+    <path d="M664 292L686 278" stroke="#05110C" stroke-width="12" stroke-linecap="round"/>
+    <path d="M736 292L714 278" stroke="#05110C" stroke-width="12" stroke-linecap="round"/>
+    <path d="M682 324L700 340L718 324" stroke="#05110C" stroke-width="12" stroke-linecap="round" stroke-linejoin="round"/>
+    <path d="M658 360L680 334L690 372" fill="#F2F7FB"/>
+    <path d="M742 360L720 334L710 372" fill="#F2F7FB"/>
+    <text x="700" y="468" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="700">Companion Field Node</text>
+  </g>
+
+  <g>
+    <rect x="1148" y="190" width="176" height="140" rx="28" fill="#071118" stroke="#31F671" stroke-width="6"/>
+    <text x="1236" y="236" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="30" font-weight="700">HIVE</text>
+    <text x="1236" y="278" text-anchor="middle" fill="#72FF57" font-family="Consolas, 'Courier New', monospace" font-size="20">LAN / Tailscale</text>
+    <text x="1236" y="308" text-anchor="middle" fill="#8B94A8" font-family="Segoe UI, Arial, sans-serif" font-size="18">Routes jobs</text>
+  </g>
+
+  <g>
+    <rect x="262" y="92" width="142" height="88" rx="24" fill="#071118" stroke="#31F671" stroke-width="5"/>
+    <text x="333" y="126" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="700">Research</text>
+    <text x="333" y="152" text-anchor="middle" fill="#8B94A8" font-family="Segoe UI, Arial, sans-serif" font-size="16">slow scrape</text>
+  </g>
+
+  <g>
+    <rect x="262" y="340" width="142" height="88" rx="24" fill="#071118" stroke="#31F671" stroke-width="5"/>
+    <text x="333" y="374" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="700">Files</text>
+    <text x="333" y="400" text-anchor="middle" fill="#8B94A8" font-family="Segoe UI, Arial, sans-serif" font-size="16">sort + rename</text>
+  </g>
+
+  <g>
+    <rect x="996" y="92" width="122" height="88" rx="24" fill="#071118" stroke="#31F671" stroke-width="5"/>
+    <text x="1057" y="126" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="700">Ollama</text>
+    <text x="1057" y="152" text-anchor="middle" fill="#8B94A8" font-family="Segoe UI, Arial, sans-serif" font-size="16">11434</text>
+  </g>
+
+  <g>
+    <rect x="996" y="340" width="122" height="88" rx="24" fill="#071118" stroke="#31F671" stroke-width="5"/>
+    <text x="1057" y="374" text-anchor="middle" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="700">HIVE API</text>
+    <text x="1057" y="400" text-anchor="middle" fill="#8B94A8" font-family="Segoe UI, Arial, sans-serif" font-size="16">7078</text>
+  </g>
+</svg>

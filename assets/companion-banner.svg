@@ -1,0 +1,84 @@
+<svg width="1600" height="720" viewBox="0 0 1600 720" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="720" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#03060E"/>
+      <stop offset="0.5" stop-color="#07131A"/>
+      <stop offset="1" stop-color="#04070C"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(1180 372) rotate(90) scale(240 300)">
+      <stop stop-color="#66FF4A" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#66FF4A" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="neon" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#A7FF5F"/>
+      <stop offset="1" stop-color="#23D978"/>
+    </linearGradient>
+    <filter id="softGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1600" height="720" fill="url(#bg)"/>
+  <rect width="1600" height="720" fill="url(#glow)"/>
+
+  <g opacity="0.34" stroke="#1CF37A" stroke-width="2">
+    <path d="M64 150H250L300 178H520"/>
+    <path d="M0 276H220L266 244H470"/>
+    <path d="M20 518H228L288 474H482"/>
+    <path d="M1436 114H1328L1288 146H1114"/>
+    <path d="M1600 266H1392L1338 234H1148"/>
+    <path d="M1548 570H1360L1306 520H1136"/>
+  </g>
+
+  <g opacity="0.6">
+    <circle cx="64" cy="150" r="8" fill="#1CF37A"/>
+    <circle cx="20" cy="518" r="8" fill="#1CF37A"/>
+    <circle cx="1436" cy="114" r="8" fill="#1CF37A"/>
+    <circle cx="1548" cy="570" r="8" fill="#1CF37A"/>
+  </g>
+
+  <g transform="translate(1188 382)">
+    <ellipse cx="0" cy="166" rx="184" ry="44" fill="#43FF64" fill-opacity="0.2"/>
+    <ellipse cx="0" cy="166" rx="114" ry="18" fill="#43FF64" fill-opacity="0.35" filter="url(#softGlow)"/>
+    <circle cx="0" cy="150" r="20" fill="#9CFF65"/>
+    <g filter="url(#softGlow)" opacity="0.95">
+      <path d="M0 148L0 -112" stroke="url(#neon)" stroke-width="10" stroke-linecap="round"/>
+      <path d="M-62 68L0 -14L62 68" stroke="url(#neon)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g transform="translate(0 -10)">
+      <path d="M-92 -164H92L138 -118V118L92 164H-92L-138 118V-118L-92 -164Z" stroke="#32F872" stroke-width="10"/>
+      <path d="M-60 -136H60L108 -88V88L60 136H-60L-108 88V-88L-60 -136Z" stroke="#8BFF5A" stroke-opacity="0.55" stroke-width="3"/>
+      <rect x="-60" y="-98" width="120" height="196" rx="28" fill="#071118" stroke="#C9FFD1" stroke-opacity="0.45" stroke-width="3"/>
+      <rect x="-26" y="-138" width="52" height="16" rx="8" fill="#35F56E"/>
+      <circle cx="0" cy="74" r="8" fill="#41FF5E"/>
+      <path d="M-18 -26L-46 6V58L-10 92H10L46 58V6L18 -26H-18Z" fill="url(#neon)"/>
+      <path d="M-8 14L-28 28" stroke="#06120D" stroke-width="9" stroke-linecap="round"/>
+      <path d="M8 14L28 28" stroke="#06120D" stroke-width="9" stroke-linecap="round"/>
+      <path d="M-14 48L0 60L14 48" stroke="#06120D" stroke-width="9" stroke-linecap="round" stroke-linejoin="round"/>
+      <path d="M-26 84L-6 68L-2 92" fill="#F3F7FB"/>
+      <path d="M26 84L6 68L2 92" fill="#F3F7FB"/>
+      <path d="M-56 -8L-138 -8" stroke="#2AF36A" stroke-width="4" stroke-linecap="round"/>
+      <path d="M56 -8L138 -8" stroke="#2AF36A" stroke-width="4" stroke-linecap="round"/>
+      <path d="M-56 28L-120 58" stroke="#2AF36A" stroke-width="3" stroke-linecap="round"/>
+      <path d="M56 28L120 58" stroke="#2AF36A" stroke-width="3" stroke-linecap="round"/>
+    </g>
+  </g>
+
+  <g transform="translate(112 150)">
+    <text x="0" y="0" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="118" font-weight="800">TheOrc</text>
+    <text x="432" y="0" fill="#67FF4D" font-family="Segoe UI, Arial, sans-serif" font-size="118" font-weight="800">Companion</text>
+    <text x="4" y="88" fill="#6FFF54" font-family="Consolas, 'Courier New', monospace" font-size="40" letter-spacing="12">FIELD NODE FOR THE HIVE MIND</text>
+    <text x="0" y="226" fill="#F8FAFC" font-family="Segoe UI, Arial, sans-serif" font-size="68" font-weight="700">Android edge console for TheOrc.</text>
+    <text x="0" y="302" fill="#8B94A8" font-family="Segoe UI, Arial, sans-serif" font-size="42">LAN and Tailscale discovery. Local setup. Small constrained jobs. Real node energy.</text>
+  </g>
+
+  <g opacity="0.25" stroke="#6FFF54" stroke-width="2">
+    <path d="M112 424H732"/>
+    <path d="M112 454H654"/>
+    <path d="M112 484H586"/>
+  </g>
+</svg>
