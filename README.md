@@ -42,7 +42,7 @@ The branding here is intentionally a sibling to TheOrc, not a clone:
 
 <div align="center">
 
-![TheOrc Companion Icon](assets/companion-icon.svg)
+![TheOrc Icon](assets/icon.png)
 
 </div>
 
