@@ -1,0 +1,12 @@
+{
+  "name": "TheORC Companion",
+  "description": "Android port and companion dashboard for TheORC orchestrator, enabling simulated local model execution and remote HIVEMIND visual synchronization.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone",
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
