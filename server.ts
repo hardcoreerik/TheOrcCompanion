@@ -1,5 +1,11 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
+import fsp from "fs/promises";
+import os from "os";
+import net from "net";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
@@ -8,8 +14,748 @@ dotenv.config();
 
 const app = express();
 const PORT = 3000;
+const ORC_OLLAMA_PORT = 11434;
+const ORC_HIVE_PORT = 7078;
+const execFileAsync = promisify(execFile);
 
 app.use(express.json());
+
+type RouteKind = "localhost" | "lan" | "tailscale";
+
+interface RouteCandidate {
+  kind: RouteKind;
+  label: string;
+  host: string;
+}
+
+interface HiveNodeInfo {
+  Name: string;
+  OllamaUrl: string;
+  Models: string[];
+  VramFreeMb: number;
+  VramTotalMb: number;
+  Lanes: string[];
+  RpcPort?: number;
+}
+
+type ExecutionLane = "RESEARCHER" | "CODER" | "UIDEVELOPER" | "TESTER";
+type ExecutionTarget = "companion_edge_node";
+type CompanionCapability = "file_sorting" | "file_naming" | "slow_scrape";
+type CompanionJobType = "organize_directory" | "scrape_url";
+type CompanionJobStatus = "pending" | "running" | "completed" | "failed";
+
+interface CompanionJob {
+  id: string;
+  type: CompanionJobType;
+  title: string;
+  status: CompanionJobStatus;
+  createdAt: string;
+  startedAt?: string;
+  completedAt?: string;
+  logicalRole: string;
+  executionLane: ExecutionLane;
+  executionTarget: ExecutionTarget;
+  capabilityRequired: CompanionCapability;
+  input: Record<string, any>;
+  result?: any;
+  error?: string;
+}
+
+interface CompanionSetupSettings {
+  version: number;
+  setupComplete: boolean;
+  companionName: string;
+  preferredHost: string;
+  joinHiveMind: boolean;
+  executionTarget: ExecutionTarget;
+  enabledCapabilities: CompanionCapability[];
+  batteryCutoffPercent: number;
+  allowMeteredNetwork: boolean;
+  lastSavedAt?: string;
+}
+
+const companionJobs: CompanionJob[] = [];
+let companionWorkerActive = false;
+const companionSettingsPath = path.join(process.env.APPDATA || process.cwd(), "TheOrcCompanion", "settings.json");
+
+function isPrivateIpv4(ip: string) {
+  return ip.startsWith("10.")
+    || ip.startsWith("192.168.")
+    || /^172\.(1[6-9]|2\d|3[0-1])\./.test(ip);
+}
+
+function getRouteCandidates(): RouteCandidate[] {
+  const seen = new Set<string>();
+  const routes: RouteCandidate[] = [
+    { kind: "localhost", label: "This PC (localhost)", host: "127.0.0.1" },
+  ];
+  seen.add("127.0.0.1");
+
+  for (const entries of Object.values(os.networkInterfaces())) {
+    for (const entry of entries ?? []) {
+      if (entry.family !== "IPv4" || entry.internal || !entry.address) continue;
+      if (seen.has(entry.address)) continue;
+
+      let kind: RouteKind | null = null;
+      if (entry.address.startsWith("100.")) {
+        kind = "tailscale";
+      } else if (isPrivateIpv4(entry.address)) {
+        kind = "lan";
+      }
+
+      if (!kind) continue;
+
+      routes.push({
+        kind,
+        label: kind === "tailscale" ? `Tailscale ${entry.address}` : `LAN ${entry.address}`,
+        host: entry.address,
+      });
+      seen.add(entry.address);
+    }
+  }
+
+  return routes;
+}
+
+function getConfiguredOrcHost() {
+  try {
+    const appData = process.env.APPDATA;
+    if (!appData) return null;
+
+    const settingsPath = path.join(appData, "OrchestratorIDE", "settings.json");
+    if (!fs.existsSync(settingsPath)) return null;
+
+    const raw = JSON.parse(fs.readFileSync(settingsPath, "utf-8"));
+    const host = normalizeTargetHost(String(raw?.ollamaHost ?? ""));
+    return host || null;
+  } catch {
+    return null;
+  }
+}
+
+function getDefaultCompanionSetupSettings(): CompanionSetupSettings {
+  const configuredHost = getConfiguredOrcHost() || "";
+  return {
+    version: 1,
+    setupComplete: false,
+    companionName: `${os.hostname()} Companion`,
+    preferredHost: configuredHost,
+    joinHiveMind: true,
+    executionTarget: "companion_edge_node",
+    enabledCapabilities: ["file_sorting", "file_naming", "slow_scrape"],
+    batteryCutoffPercent: 20,
+    allowMeteredNetwork: false,
+  };
+}
+
+async function readCompanionSetupSettings() {
+  try {
+    const raw = JSON.parse(await fsp.readFile(companionSettingsPath, "utf-8"));
+    const defaults = getDefaultCompanionSetupSettings();
+    const enabledCapabilities = Array.isArray(raw?.enabledCapabilities)
+      ? raw.enabledCapabilities.filter((capability: unknown): capability is CompanionCapability =>
+          capability === "file_sorting" || capability === "file_naming" || capability === "slow_scrape")
+      : defaults.enabledCapabilities;
+
+    return {
+      ...defaults,
+      ...raw,
+      companionName: String(raw?.companionName ?? defaults.companionName).trim() || defaults.companionName,
+      preferredHost: normalizeTargetHost(String(raw?.preferredHost ?? defaults.preferredHost)),
+      joinHiveMind: Boolean(raw?.joinHiveMind ?? defaults.joinHiveMind),
+      executionTarget: "companion_edge_node" as const,
+      enabledCapabilities: enabledCapabilities.length ? enabledCapabilities : defaults.enabledCapabilities,
+      batteryCutoffPercent: Math.max(5, Math.min(80, Number(raw?.batteryCutoffPercent ?? defaults.batteryCutoffPercent))),
+      allowMeteredNetwork: Boolean(raw?.allowMeteredNetwork),
+      setupComplete: Boolean(raw?.setupComplete),
+    } satisfies CompanionSetupSettings;
+  } catch {
+    return getDefaultCompanionSetupSettings();
+  }
+}
+
+async function writeCompanionSetupSettings(settings: CompanionSetupSettings) {
+  await fsp.mkdir(path.dirname(companionSettingsPath), { recursive: true });
+  await fsp.writeFile(
+    companionSettingsPath,
+    JSON.stringify({ ...settings, lastSavedAt: new Date().toISOString() }, null, 2),
+    "utf-8",
+  );
+}
+
+async function getTailscaleStatus() {
+  try {
+    const { stdout } = await execFileAsync("tailscale", ["status", "--json"], {
+      timeout: 4000,
+      windowsHide: true,
+    });
+    const parsed = JSON.parse(stdout);
+    const peers = Object.values(parsed?.Peer ?? {})
+      .map((peer: any) => ({
+        dnsName: String(peer?.DNSName ?? "").replace(/\.$/, ""),
+        ip: Array.isArray(peer?.TailscaleIPs) ? String(peer.TailscaleIPs[0] ?? "") : "",
+        online: Boolean(peer?.Online),
+      }))
+      .filter((peer) => peer.ip);
+
+    return {
+      installed: true,
+      peers,
+    };
+  } catch {
+    return {
+      installed: false,
+      peers: [] as Array<{ dnsName: string; ip: string; online: boolean }>,
+    };
+  }
+}
+
+function normalizeTargetHost(target: string) {
+  const trimmed = target.trim();
+  if (!trimmed) return "";
+
+  try {
+    if (/^https?:\/\//i.test(trimmed)) {
+      return new URL(trimmed).hostname;
+    }
+  } catch {
+    return "";
+  }
+
+  if (trimmed.includes("/")) {
+    return trimmed.split("/")[0].trim();
+  }
+
+  if (net.isIP(trimmed)) return trimmed;
+  if (trimmed.includes(":")) return trimmed.split(":")[0].trim();
+  return trimmed;
+}
+
+async function probeJson<T>(url: string, timeoutMs = 2500): Promise<{ ok: true; data: T; latencyMs: number; sizeBytes: number } | { ok: false; error: string }> {
+  const started = Date.now();
+  try {
+    const response = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!response.ok) {
+      return { ok: false, error: `HTTP ${response.status}` };
+    }
+
+    const text = await response.text();
+    return {
+      ok: true,
+      data: JSON.parse(text) as T,
+      latencyMs: Date.now() - started,
+      sizeBytes: Buffer.byteLength(text),
+    };
+  } catch (error: any) {
+    return { ok: false, error: error?.message || "Probe failed" };
+  }
+}
+
+function summarizeStatus(hiveOk: boolean, ollamaOk: boolean): "optimal" | "unstable" | "offline" {
+  if (hiveOk && ollamaOk) return "optimal";
+  if (hiveOk || ollamaOk) return "unstable";
+  return "offline";
+}
+
+function getJobExecutionProfile(type: CompanionJobType): {
+  logicalRole: string;
+  executionLane: ExecutionLane;
+  executionTarget: ExecutionTarget;
+  capabilityRequired: CompanionCapability;
+} {
+  if (type === "scrape_url") {
+    return {
+      logicalRole: "RESEARCHER",
+      executionLane: "RESEARCHER",
+      executionTarget: "companion_edge_node",
+      capabilityRequired: "slow_scrape",
+    };
+  }
+
+  return {
+    logicalRole: "DATA_ENGINEER",
+    executionLane: "CODER",
+    executionTarget: "companion_edge_node",
+    capabilityRequired: "file_sorting",
+  };
+}
+
+function summarizeInstallState(
+  setup: CompanionSetupSettings,
+  detection: {
+    configuredHost: string | null;
+    tailscaleInstalled: boolean;
+    localHiveReachable: boolean;
+    localOllamaReachable: boolean;
+  },
+) {
+  const checks = [
+    Boolean(setup.companionName.trim()),
+    setup.joinHiveMind,
+    Boolean(setup.preferredHost || detection.configuredHost),
+    detection.localOllamaReachable || detection.tailscaleInstalled,
+  ];
+  const completedSteps = checks.filter(Boolean).length;
+  return {
+    completedSteps,
+    totalSteps: checks.length,
+    ready: setup.setupComplete && completedSteps >= 3,
+  };
+}
+
+function createJobId(prefix: string) {
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getCurrentCompanionJob() {
+  return companionJobs.find((job) => job.status === "running") ?? null;
+}
+
+function categoryForExtension(ext: string) {
+  const normalized = ext.toLowerCase();
+  if ([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".heic"].includes(normalized)) return "images";
+  if ([".mp4", ".mov", ".mkv", ".avi", ".webm"].includes(normalized)) return "video";
+  if ([".mp3", ".wav", ".m4a", ".flac", ".ogg"].includes(normalized)) return "audio";
+  if ([".pdf", ".doc", ".docx", ".txt", ".md", ".rtf"].includes(normalized)) return "documents";
+  if ([".csv", ".tsv", ".json", ".xml", ".yaml", ".yml"].includes(normalized)) return "data";
+  if ([".zip", ".7z", ".rar", ".tar", ".gz"].includes(normalized)) return "archives";
+  if ([".js", ".ts", ".tsx", ".jsx", ".py", ".cs", ".cpp", ".h", ".html", ".css", ".java", ".go", ".rs"].includes(normalized)) return "code";
+  return "misc";
+}
+
+function toTitleCase(input: string) {
+  return input
+    .split(" ")
+    .filter(Boolean)
+    .map((part) => part[0].toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function sanitizeBaseName(name: string) {
+  const normalized = name
+    .replace(/[_\-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[^\w\s()[\]&.,]/g, "")
+    .trim();
+  return toTitleCase(normalized || "Untitled");
+}
+
+async function uniquePath(targetPath: string) {
+  const parsed = path.parse(targetPath);
+  let candidate = targetPath;
+  let index = 2;
+
+  while (true) {
+    try {
+      await fsp.access(candidate);
+      candidate = path.join(parsed.dir, `${parsed.name} (${index})${parsed.ext}`);
+      index += 1;
+    } catch {
+      return candidate;
+    }
+  }
+}
+
+async function runOrganizeDirectoryJob(input: Record<string, any>) {
+  const rootPath = path.resolve(String(input.rootPath ?? ""));
+  const applyChanges = Boolean(input.applyChanges);
+  const maxFiles = Math.max(1, Math.min(200, Number(input.maxFiles ?? 50)));
+
+  if (!rootPath || rootPath === path.parse(rootPath).root) {
+    throw new Error("Choose a real folder path, not a drive root.");
+  }
+
+  const stat = await fsp.stat(rootPath).catch(() => null);
+  if (!stat?.isDirectory()) {
+    throw new Error("Root path does not exist or is not a directory.");
+  }
+
+  const entries = await fsp.readdir(rootPath, { withFileTypes: true });
+  const files = entries
+    .filter((entry) => entry.isFile())
+    .slice(0, maxFiles);
+
+  const operations: Array<Record<string, any>> = [];
+  const categoryCounts: Record<string, number> = {};
+
+  for (const file of files) {
+    const sourcePath = path.join(rootPath, file.name);
+    const parsed = path.parse(file.name);
+    const category = categoryForExtension(parsed.ext);
+    const suggestedName = `${sanitizeBaseName(parsed.name)}${parsed.ext.toLowerCase()}`;
+    const suggestedDir = path.join(rootPath, category);
+    const suggestedPath = path.join(suggestedDir, suggestedName);
+    categoryCounts[category] = (categoryCounts[category] ?? 0) + 1;
+
+    const operation: Record<string, any> = {
+      originalName: file.name,
+      originalPath: sourcePath,
+      category,
+      suggestedName,
+      suggestedFolder: category,
+      suggestedPath,
+      applied: false,
+    };
+
+    if (applyChanges) {
+      await fsp.mkdir(suggestedDir, { recursive: true });
+      const finalPath = await uniquePath(suggestedPath);
+      await fsp.rename(sourcePath, finalPath);
+      operation.applied = true;
+      operation.finalPath = finalPath;
+    }
+
+    operations.push(operation);
+  }
+
+  return {
+    rootPath,
+    applyChanges,
+    scannedFiles: files.length,
+    categoryCounts,
+    operations,
+  };
+}
+
+function stripHtml(html: string) {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function summarizeText(text: string, maxChars = 320) {
+  const trimmed = text.trim();
+  if (trimmed.length <= maxChars) return trimmed;
+
+  const sentences = trimmed.match(/[^.!?]+[.!?]+/g) ?? [];
+  let summary = "";
+  for (const sentence of sentences) {
+    if ((summary + sentence).length > maxChars) break;
+    summary += sentence.trim() + " ";
+  }
+
+  return (summary.trim() || `${trimmed.slice(0, maxChars).trim()}...`);
+}
+
+async function runScrapeUrlJob(input: Record<string, any>) {
+  const url = String(input.url ?? "").trim();
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error("Provide a full http:// or https:// URL.");
+  }
+
+  const response = await fetch(url, { signal: AbortSignal.timeout(12000) });
+  if (!response.ok) {
+    throw new Error(`Target responded with HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  const text = stripHtml(html);
+  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+  const title = titleMatch?.[1]?.replace(/\s+/g, " ").trim() || new URL(url).hostname;
+  const summary = summarizeText(text);
+  const linkCount = (html.match(/<a\b/gi) ?? []).length;
+
+  return {
+    url,
+    title,
+    summary,
+    textSample: text.slice(0, 1200),
+    textLength: text.length,
+    linkCount,
+  };
+}
+
+async function processCompanionJobs() {
+  if (companionWorkerActive) return;
+  companionWorkerActive = true;
+
+  try {
+    while (true) {
+      const nextJob = companionJobs.find((job) => job.status === "pending");
+      if (!nextJob) break;
+
+      nextJob.status = "running";
+      nextJob.startedAt = new Date().toISOString();
+
+      try {
+        if (nextJob.type === "organize_directory") {
+          nextJob.result = await runOrganizeDirectoryJob(nextJob.input);
+        } else if (nextJob.type === "scrape_url") {
+          nextJob.result = await runScrapeUrlJob(nextJob.input);
+        } else {
+          throw new Error(`Unsupported job type: ${nextJob.type}`);
+        }
+
+        nextJob.status = "completed";
+        nextJob.completedAt = new Date().toISOString();
+      } catch (error: any) {
+        nextJob.status = "failed";
+        nextJob.error = error?.message || "Job failed";
+        nextJob.completedAt = new Date().toISOString();
+      }
+    }
+  } finally {
+    companionWorkerActive = false;
+  }
+}
+
+function enqueueCompanionJob(type: CompanionJobType, input: Record<string, any>, title: string) {
+  const profile = getJobExecutionProfile(type);
+  const job: CompanionJob = {
+    id: createJobId("job"),
+    type,
+    title,
+    status: "pending",
+    createdAt: new Date().toISOString(),
+    logicalRole: profile.logicalRole,
+    executionLane: profile.executionLane,
+    executionTarget: profile.executionTarget,
+    capabilityRequired: profile.capabilityRequired,
+    input,
+  };
+
+  companionJobs.unshift(job);
+  void processCompanionJobs();
+  return job;
+}
+
+app.get("/api/companion-node/status", async (_req, res) => {
+  const routes = getRouteCandidates();
+  const currentJob = getCurrentCompanionJob();
+  const setup = await readCompanionSetupSettings();
+  const ollamaProbe = await probeJson<{ models?: Array<{ name?: string }> }>(`http://127.0.0.1:${ORC_OLLAMA_PORT}/api/tags`);
+  const hiveProbe = await probeJson<HiveNodeInfo>(`http://127.0.0.1:${ORC_HIVE_PORT}/hive/info`);
+  const tailscale = await getTailscaleStatus();
+  const configuredHost = getConfiguredOrcHost();
+
+  res.json({
+    nodeId: os.hostname().toLowerCase(),
+    nodeName: setup.companionName,
+    role: "companion-edge-node",
+    status: currentJob ? "busy" : "idle",
+    setup,
+    lanes: ["RESEARCHER", "CODER"],
+    logicalRoles: ["RESEARCHER", "DATA_ENGINEER"],
+    executionTarget: "companion_edge_node",
+    capabilities: setup.enabledCapabilities,
+    jobTypes: ["organize_directory", "scrape_url"],
+    queueDepth: companionJobs.filter((job) => job.status === "pending").length,
+    completedJobs: companionJobs.filter((job) => job.status === "completed").length,
+    failedJobs: companionJobs.filter((job) => job.status === "failed").length,
+    currentJob,
+    routes: routes.map((route) => ({
+      kind: route.kind,
+      label: route.label,
+      host: route.host,
+    })),
+    ollama: {
+      reachable: ollamaProbe.ok,
+      modelCount: ollamaProbe.ok ? (ollamaProbe.data.models ?? []).length : 0,
+    },
+    installState: summarizeInstallState(setup, {
+      configuredHost,
+      tailscaleInstalled: tailscale.installed,
+      localHiveReachable: hiveProbe.ok,
+      localOllamaReachable: ollamaProbe.ok,
+    }),
+  });
+});
+
+app.get("/api/companion-node/jobs", (_req, res) => {
+  res.json({
+    jobs: companionJobs.slice(0, 30),
+  });
+});
+
+app.get("/api/companion-node/setup", async (_req, res) => {
+  const setup = await readCompanionSetupSettings();
+  const tailscale = await getTailscaleStatus();
+  const configuredHost = getConfiguredOrcHost();
+  const localHive = await probeJson<HiveNodeInfo>(`http://127.0.0.1:${ORC_HIVE_PORT}/hive/info`);
+  const localOllama = await probeJson<{ models?: Array<{ name?: string }> }>(`http://127.0.0.1:${ORC_OLLAMA_PORT}/api/tags`);
+
+  res.json({
+    setup,
+    detection: {
+      configuredHost,
+      tailscaleInstalled: tailscale.installed,
+      tailscalePeerCount: tailscale.peers.filter((peer) => peer.online).length,
+      localHiveReachable: localHive.ok,
+      localOllamaReachable: localOllama.ok,
+      settingsPath: companionSettingsPath,
+      orcSettingsDetected: Boolean(configuredHost),
+    },
+    installState: summarizeInstallState(setup, {
+      configuredHost,
+      tailscaleInstalled: tailscale.installed,
+      localHiveReachable: localHive.ok,
+      localOllamaReachable: localOllama.ok,
+    }),
+  });
+});
+
+app.post("/api/companion-node/setup", async (req, res) => {
+  const defaults = getDefaultCompanionSetupSettings();
+  const requestedCapabilities = Array.isArray(req.body?.enabledCapabilities)
+    ? req.body.enabledCapabilities.filter((capability: unknown): capability is CompanionCapability =>
+        capability === "file_sorting" || capability === "file_naming" || capability === "slow_scrape")
+    : defaults.enabledCapabilities;
+
+  const setup: CompanionSetupSettings = {
+    version: 1,
+    setupComplete: Boolean(req.body?.setupComplete),
+    companionName: String(req.body?.companionName ?? defaults.companionName).trim() || defaults.companionName,
+    preferredHost: normalizeTargetHost(String(req.body?.preferredHost ?? defaults.preferredHost)),
+    joinHiveMind: Boolean(req.body?.joinHiveMind ?? defaults.joinHiveMind),
+    executionTarget: "companion_edge_node",
+    enabledCapabilities: requestedCapabilities.length ? requestedCapabilities : defaults.enabledCapabilities,
+    batteryCutoffPercent: Math.max(5, Math.min(80, Number(req.body?.batteryCutoffPercent ?? defaults.batteryCutoffPercent))),
+    allowMeteredNetwork: Boolean(req.body?.allowMeteredNetwork ?? defaults.allowMeteredNetwork),
+  };
+
+  await writeCompanionSetupSettings(setup);
+  res.json({ ok: true, setup });
+});
+
+app.post("/api/companion-node/jobs", async (req, res) => {
+  const type = String(req.body?.type ?? "") as CompanionJobType;
+  const input = (req.body?.input ?? {}) as Record<string, any>;
+  const setup = await readCompanionSetupSettings();
+
+  if (type !== "organize_directory" && type !== "scrape_url") {
+    res.status(400).json({ error: "Unsupported job type." });
+    return;
+  }
+
+  const profile = getJobExecutionProfile(type);
+  const requiredCapabilities = profile.capabilityRequired === "file_sorting"
+    ? ["file_sorting", "file_naming"]
+    : [profile.capabilityRequired];
+  const missingCapability = requiredCapabilities.find((capability) => !setup.enabledCapabilities.includes(capability as CompanionCapability));
+  if (missingCapability) {
+    res.status(400).json({ error: `Companion setup has ${missingCapability} disabled.` });
+    return;
+  }
+
+  const title = type === "organize_directory"
+    ? `Organize ${String(input.rootPath ?? "directory")}`
+    : `Scrape ${String(input.url ?? "url")}`;
+
+  const job = enqueueCompanionJob(type, input, title);
+  res.status(202).json({ job });
+});
+
+app.get("/api/hive/network-targets", async (_req, res) => {
+  const configuredHost = getConfiguredOrcHost();
+  const routes = getRouteCandidates().sort((left, right) => {
+    const score = (route: RouteCandidate) => {
+      if (configuredHost && route.host === configuredHost) return 100;
+      if (route.kind === "lan" && !route.host.endsWith(".1")) return 80;
+      if (route.kind === "tailscale" && !route.host.endsWith(".1")) return 70;
+      if (route.kind === "localhost") return 60;
+      if (route.kind === "lan") return 50;
+      return 40;
+    };
+    return score(right) - score(left);
+  });
+  const tailscale = await getTailscaleStatus();
+
+  const localProbe = await probeJson<HiveNodeInfo>(`http://127.0.0.1:${ORC_HIVE_PORT}/hive/info`);
+  const ollamaProbe = await probeJson<{ models?: Array<{ name?: string }> }>(`http://127.0.0.1:${ORC_OLLAMA_PORT}/api/tags`);
+
+  res.json({
+    companion: {
+      port: PORT,
+      routes: routes.map((route) => ({
+        ...route,
+        companionUrl: `http://${route.host}:${PORT}`,
+        hiveInfoUrl: `http://${route.host}:${ORC_HIVE_PORT}/hive/info`,
+        ollamaUrl: `http://${route.host}:${ORC_OLLAMA_PORT}`,
+      })),
+    },
+    tailscale,
+    configuredHost,
+    localHive: localProbe.ok ? localProbe.data : null,
+    localOllamaReachable: ollamaProbe.ok,
+  });
+});
+
+app.post("/api/hive/test-connection", async (req, res) => {
+  const target = String(req.body?.target ?? "");
+  const host = normalizeTargetHost(target);
+  if (!host) {
+    res.status(400).json({ error: "Provide a host, IP, or URL to probe." });
+    return;
+  }
+
+  const hiveInfoUrl = `http://${host}:${ORC_HIVE_PORT}/hive/info`;
+  const ollamaTagsUrl = `http://${host}:${ORC_OLLAMA_PORT}/api/tags`;
+
+  const [hiveProbe, ollamaProbe] = await Promise.all([
+    probeJson<HiveNodeInfo>(hiveInfoUrl),
+    probeJson<{ models?: Array<{ name?: string }> }>(ollamaTagsUrl),
+  ]);
+
+  const latencies: number[] = [];
+  if (hiveProbe.ok) latencies.push(hiveProbe.latencyMs);
+  if (ollamaProbe.ok) latencies.push(ollamaProbe.latencyMs);
+  const averageLatency = latencies.length
+    ? Math.round(latencies.reduce((sum, value) => sum + value, 0) / latencies.length)
+    : 0;
+  const jitter = latencies.length > 1 ? Math.abs(latencies[0] - latencies[1]) : 0;
+  let totalBytes = 0;
+  if (hiveProbe.ok) totalBytes += hiveProbe.sizeBytes;
+  if (ollamaProbe.ok) totalBytes += ollamaProbe.sizeBytes;
+  const bandwidth = averageLatency > 0
+    ? Number(((totalBytes / 1024) / (averageLatency / 1000)).toFixed(2))
+    : 0;
+
+  const hiveData = hiveProbe.ok ? hiveProbe.data : null;
+  const ollamaModels = ollamaProbe.ok
+    ? (ollamaProbe.data.models ?? [])
+        .map((model) => model?.name)
+        .filter((name): name is string => Boolean(name))
+    : [];
+  let hiveError = "";
+  if ("error" in hiveProbe) hiveError = hiveProbe.error;
+  let ollamaError = "";
+  if ("error" in ollamaProbe) ollamaError = ollamaProbe.error;
+
+  const status = summarizeStatus(Boolean(hiveData), ollamaProbe.ok);
+  const testLog = [
+    `Resolving target host ${host}...`,
+    hiveProbe.ok
+      ? `HIVE node API responded in ${hiveProbe.latencyMs}ms from ${hiveInfoUrl}`
+      : `HIVE node API unavailable at ${hiveInfoUrl}: ${hiveError}`,
+    ollamaProbe.ok
+      ? `Ollama responded in ${ollamaProbe.latencyMs}ms from ${ollamaTagsUrl}`
+      : `Ollama unavailable at ${ollamaTagsUrl}: ${ollamaError}`,
+  ];
+
+  res.json({
+    targetHost: host,
+    status,
+    latency: averageLatency,
+    jitter,
+    packetLoss: hiveProbe.ok || ollamaProbe.ok ? 0 : 100,
+    bandwidth,
+    endpoints: {
+      hiveInfoUrl,
+      ollamaTagsUrl,
+      companionUrl: `http://${host}:${PORT}`,
+    },
+    hiveNode: hiveData,
+    ollama: {
+      reachable: ollamaProbe.ok,
+      modelCount: ollamaModels.length,
+      models: ollamaModels.slice(0, 12),
+    },
+    testLog,
+  });
+});
 
 // Lazy-loaded Google GenAI Helper to prevent startup failure if API key is missing
 function getGeminiClient() {

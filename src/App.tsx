@@ -8,13 +8,12 @@ import AndroidCompanionHub from "./components/AndroidCompanionHub";
 import ResearchHub from "./components/ResearchHub";
 import { 
   Network, 
-  Smartphone, 
   Send, 
   Play, 
   Cpu, 
   Server,
   CloudLightning, 
-  Sliders, 
+  Sliders,
   CheckCircle,
   HelpCircle,
   Info
@@ -123,7 +122,6 @@ export default function App() {
   const [activeExecIndex, setActiveExecIndex] = useState(-1);
   const [activeLocalPayload, setActiveLocalPayload] = useState("");
   const [autoExecute, setAutoExecute] = useState(true);
-  const [viewMode, setViewMode] = useState<'dashboard' | 'phone'>('dashboard');
   const [activeTab, setActiveTab] = useState<'console' | 'local_slm' | 'android_hub' | 'sensors' | 'research'>('console');
   const [selectedModel, setSelectedModel] = useState("gemini-2.5-flash");
   const [simulatedDeviceRam, setSimulatedDeviceRam] = useState(8); // in GB
@@ -359,31 +357,8 @@ export default function App() {
 
         {/* Action controls */}
         <div className="flex flex-wrap items-center gap-3">
-          
-          {/* Dual Screen mode selector */}
-          <div className="bg-slate-900/60 border border-slate-800 p-1 rounded-full flex">
-            <button
-              onClick={() => setViewMode('dashboard')}
-              className={`flex items-center gap-1.5 px-4.5 py-1.5 rounded-full font-mono text-[10px] font-bold tracking-wider cursor-pointer transition ${
-                viewMode === 'dashboard'
-                  ? 'bg-indigo-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Sliders className="w-3.5 h-3.5" />
-              <span>DASHBOARD</span>
-            </button>
-            <button
-              onClick={() => setViewMode('phone')}
-              className={`flex items-center gap-1.5 px-4.5 py-1.5 rounded-full font-mono text-[10px] font-bold tracking-wider cursor-pointer transition ${
-                viewMode === 'phone'
-                  ? 'bg-indigo-600 text-white shadow'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              <Smartphone className="w-3.5 h-3.5" />
-              <span>HANDSET MOCK</span>
-            </button>
+          <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 px-3.5 py-1.5 rounded-full">
+            <span className="text-[10px] font-mono uppercase text-slate-300">Layout: Real Companion Dashboard</span>
           </div>
 
           <div className="flex items-center gap-2 bg-slate-900 border border-slate-800 px-3.5 py-1.5 rounded-full">
@@ -425,7 +400,7 @@ export default function App() {
           const coherenceRating = connState === 'connected' ? "99.8%" : (connState === 'simulating' ? "94.4%" : "0.0%");
           const edgeLatencyValue = connState === 'connected' ? (isOrchestrating ? "18ms" : "14ms") : "Disconnected";
 
-          if (viewMode === 'dashboard') {
+          if (true) {
             return (
               /* =========================================================
                  1. DASHBOARD PORT CONTROL (BENTO GRID WITH TABS)
