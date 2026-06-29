@@ -4,11 +4,14 @@ import fs from "fs";
 import fsp from "fs/promises";
 import os from "os";
 import net from "net";
+import { randomBytes } from "crypto";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { fetchPage } from "./src/lib/tools/fetchPage.js";
+import { formatWebSearchForLlm, webSearch } from "./src/lib/tools/webSearch.js";
 
 dotenv.config();
 
@@ -19,6 +22,20 @@ const ORC_HIVE_PORT = 7078;
 const execFileAsync = promisify(execFile);
 
 app.use(express.json());
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    res.header("Access-Control-Allow-Origin", origin);
+    res.header("Vary", "Origin");
+  }
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    res.sendStatus(204);
+    return;
+  }
+  next();
+});
 
 type RouteKind = "localhost" | "lan" | "tailscale";
 
@@ -43,6 +60,68 @@ type ExecutionTarget = "companion_edge_node";
 type CompanionCapability = "file_sorting" | "file_naming" | "slow_scrape";
 type CompanionJobType = "organize_directory" | "scrape_url";
 type CompanionJobStatus = "pending" | "running" | "completed" | "failed";
+type HiveTrustState = "unpaired_observer" | "pairing_ready" | "paired_member_pending_server_enforcement" | "blocked_untrusted";
+type HiveLocalDecision = "discovered" | "approved_candidate" | "paired_placeholder" | "revoked";
+
+interface HivePeerRouteRecord {
+  kind: RouteKind;
+  label: string;
+  host: string;
+}
+
+interface KnownHivePeer {
+  peerId: string;
+  displayName: string;
+  routes: HivePeerRouteRecord[];
+  firstSeenAt: string;
+  lastSeenAt: string;
+  trustState: HiveTrustState;
+  localDecision: HiveLocalDecision;
+  protocolVersion: string;
+  serverEnforcementKnown: boolean;
+  peerIdentityKey: string;
+}
+
+interface HiveObservationRecord {
+  peerId: string;
+  displayName: string;
+  route: HivePeerRouteRecord;
+  observedAt: string;
+  firstObservedAt: string;
+  visibilityState: "visible" | "approved_locally" | "blocked";
+  trustState: HiveTrustState;
+  serverEnforcementKnown: boolean;
+}
+
+interface HiveProtocolContext {
+  protocolVersion: string;
+  clientRole: "companion_observer";
+  trustState: HiveTrustState;
+  capabilityIntent: Array<"observer" | "control">;
+  peerId: string;
+  nonce: string;
+  timestamp: string;
+  authPresent: boolean;
+  signatureHeader: string | null;
+}
+
+interface HiveObserverDiagnosticsRecord {
+  id: string;
+  createdAt: string;
+  targetHost: string;
+  routeKind: RouteKind | "manual";
+  protocolContext: HiveProtocolContext;
+  discoverableEndpoints: string[];
+  metadataExposure: {
+    hiveReachable: boolean;
+    ollamaReachable: boolean;
+    hiveName?: string;
+    laneCount: number;
+    modelCount: number;
+  };
+  refusedOperations: string[];
+  notes: string[];
+}
 
 interface CompanionJob {
   id: string;
@@ -76,7 +155,10 @@ interface CompanionSetupSettings {
 
 const companionJobs: CompanionJob[] = [];
 let companionWorkerActive = false;
-const companionSettingsPath = path.join(process.env.APPDATA || process.cwd(), "TheOrcCompanion", "settings.json");
+const companionDataDir = path.join(process.env.APPDATA || process.cwd(), "TheOrcCompanion");
+const companionSettingsPath = path.join(companionDataDir, "settings.json");
+const hivePeersPath = path.join(companionDataDir, "hive-peers.json");
+const observerDiagnosticsPath = path.join(companionDataDir, "hive-observer-diagnostics.json");
 
 function isPrivateIpv4(ip: string) {
   return ip.startsWith("10.")
@@ -181,6 +263,144 @@ async function writeCompanionSetupSettings(settings: CompanionSetupSettings) {
     JSON.stringify({ ...settings, lastSavedAt: new Date().toISOString() }, null, 2),
     "utf-8",
   );
+}
+
+function peerIdForHost(host: string) {
+  return `peer:${host.toLowerCase()}`;
+}
+
+function protocolContextForPeer(peerId: string, trustState: HiveTrustState): HiveProtocolContext {
+  return {
+    protocolVersion: "hive-pairing-prep-v1",
+    clientRole: "companion_observer",
+    trustState,
+    capabilityIntent: ["observer"],
+    peerId,
+    nonce: randomBytes(12).toString("hex"),
+    timestamp: new Date().toISOString(),
+    authPresent: false,
+    signatureHeader: null,
+  };
+}
+
+async function readKnownHivePeers() {
+  try {
+    const raw = JSON.parse(await fsp.readFile(hivePeersPath, "utf-8"));
+    if (!Array.isArray(raw)) return [] as KnownHivePeer[];
+    return raw
+      .filter((entry): entry is KnownHivePeer => Boolean(entry?.peerId && entry?.displayName && Array.isArray(entry?.routes)))
+      .map((entry) => ({
+        peerId: String(entry.peerId),
+        displayName: String(entry.displayName),
+        routes: entry.routes
+          .filter((route: any) => route?.host && route?.label && route?.kind)
+          .map((route: any) => ({
+            kind: route.kind as RouteKind,
+            label: String(route.label),
+            host: String(route.host),
+          })),
+        firstSeenAt: String(entry.firstSeenAt ?? new Date().toISOString()),
+        lastSeenAt: String(entry.lastSeenAt ?? new Date().toISOString()),
+        localDecision: (entry.localDecision ?? "discovered") as HiveLocalDecision,
+        trustState: trustStateForDecision((entry.localDecision ?? "discovered") as HiveLocalDecision),
+        protocolVersion: String(entry.protocolVersion ?? "hive-pairing-prep-v1"),
+        serverEnforcementKnown: Boolean(entry.serverEnforcementKnown),
+        peerIdentityKey: String(entry.peerIdentityKey ?? ""),
+      }));
+  } catch {
+    return [] as KnownHivePeer[];
+  }
+}
+
+async function writeKnownHivePeers(peers: KnownHivePeer[]) {
+  await fsp.mkdir(companionDataDir, { recursive: true });
+  await fsp.writeFile(hivePeersPath, JSON.stringify(peers, null, 2), "utf-8");
+}
+
+async function readObserverDiagnostics() {
+  try {
+    const raw = JSON.parse(await fsp.readFile(observerDiagnosticsPath, "utf-8"));
+    return Array.isArray(raw) ? raw as HiveObserverDiagnosticsRecord[] : [] as HiveObserverDiagnosticsRecord[];
+  } catch {
+    return [] as HiveObserverDiagnosticsRecord[];
+  }
+}
+
+async function writeObserverDiagnostics(records: HiveObserverDiagnosticsRecord[]) {
+  await fsp.mkdir(companionDataDir, { recursive: true });
+  await fsp.writeFile(observerDiagnosticsPath, JSON.stringify(records.slice(0, 20), null, 2), "utf-8");
+}
+
+function trustStateForDecision(decision: HiveLocalDecision): HiveTrustState {
+  switch (decision) {
+    case "approved_candidate":
+      return "pairing_ready";
+    case "paired_placeholder":
+      return "paired_member_pending_server_enforcement";
+    case "revoked":
+      return "blocked_untrusted";
+    default:
+      return "unpaired_observer";
+  }
+}
+
+function visibilityStateForTrust(trustState: HiveTrustState) {
+  if (trustState === "blocked_untrusted") return "blocked" as const;
+  if (trustState === "unpaired_observer") return "visible" as const;
+  return "approved_locally" as const;
+}
+
+async function upsertObservedHivePeer(route: RouteCandidate, displayName?: string) {
+  const peers = await readKnownHivePeers();
+  const peerId = peerIdForHost(route.host);
+  const now = new Date().toISOString();
+  const existing = peers.find((peer) => peer.peerId === peerId);
+  if (existing) {
+    existing.displayName = displayName || existing.displayName || route.label;
+    existing.lastSeenAt = now;
+    const routeExists = existing.routes.some((knownRoute) => knownRoute.host === route.host && knownRoute.kind === route.kind);
+    if (!routeExists) {
+      existing.routes.push({ kind: route.kind, label: route.label, host: route.host });
+    }
+  } else {
+    peers.push({
+      peerId,
+      displayName: displayName || route.label,
+      routes: [{ kind: route.kind, label: route.label, host: route.host }],
+      firstSeenAt: now,
+      lastSeenAt: now,
+      trustState: "unpaired_observer",
+      localDecision: "discovered",
+      protocolVersion: "hive-pairing-prep-v1",
+      serverEnforcementKnown: false,
+      peerIdentityKey: "",
+    });
+  }
+  await writeKnownHivePeers(peers);
+  return peers.find((peer) => peer.peerId === peerId)!;
+}
+
+function getPeerForRoute(peers: KnownHivePeer[], route: RouteCandidate) {
+  return peers.find((peer) => peer.routes.some((peerRoute) => peerRoute.host === route.host));
+}
+
+function buildObservationFromRoute(route: RouteCandidate, peer?: KnownHivePeer): HiveObservationRecord {
+  const observedAt = new Date().toISOString();
+  const trustState = peer?.trustState ?? "unpaired_observer";
+  return {
+    peerId: peer?.peerId ?? peerIdForHost(route.host),
+    displayName: peer?.displayName ?? route.label,
+    route: {
+      kind: route.kind,
+      label: route.label,
+      host: route.host,
+    },
+    observedAt,
+    firstObservedAt: peer?.firstSeenAt ?? observedAt,
+    visibilityState: visibilityStateForTrust(trustState),
+    trustState,
+    serverEnforcementKnown: peer?.serverEnforcementKnown ?? false,
+  };
 }
 
 async function getTailscaleStatus() {
@@ -417,54 +637,16 @@ async function runOrganizeDirectoryJob(input: Record<string, any>) {
   };
 }
 
-function stripHtml(html: string) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function summarizeText(text: string, maxChars = 320) {
-  const trimmed = text.trim();
-  if (trimmed.length <= maxChars) return trimmed;
-
-  const sentences = trimmed.match(/[^.!?]+[.!?]+/g) ?? [];
-  let summary = "";
-  for (const sentence of sentences) {
-    if ((summary + sentence).length > maxChars) break;
-    summary += sentence.trim() + " ";
-  }
-
-  return (summary.trim() || `${trimmed.slice(0, maxChars).trim()}...`);
-}
-
 async function runScrapeUrlJob(input: Record<string, any>) {
   const url = String(input.url ?? "").trim();
-  if (!/^https?:\/\//i.test(url)) {
-    throw new Error("Provide a full http:// or https:// URL.");
-  }
-
-  const response = await fetch(url, { signal: AbortSignal.timeout(12000) });
-  if (!response.ok) {
-    throw new Error(`Target responded with HTTP ${response.status}`);
-  }
-
-  const html = await response.text();
-  const text = stripHtml(html);
-  const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
-  const title = titleMatch?.[1]?.replace(/\s+/g, " ").trim() || new URL(url).hostname;
-  const summary = summarizeText(text);
-  const linkCount = (html.match(/<a\b/gi) ?? []).length;
-
+  const result = await fetchPage({ url, allowPrivateHosts: true });
   return {
-    url,
-    title,
-    summary,
-    textSample: text.slice(0, 1200),
-    textLength: text.length,
-    linkCount,
+    url: result.url,
+    title: result.title,
+    summary: result.summary,
+    textSample: result.textSample,
+    textLength: result.textLength,
+    linkCount: result.linkCount,
   };
 }
 
@@ -526,6 +708,7 @@ app.get("/api/companion-node/status", async (_req, res) => {
   const routes = getRouteCandidates();
   const currentJob = getCurrentCompanionJob();
   const setup = await readCompanionSetupSettings();
+  const knownPeers = await readKnownHivePeers();
   const ollamaProbe = await probeJson<{ models?: Array<{ name?: string }> }>(`http://127.0.0.1:${ORC_OLLAMA_PORT}/api/tags`);
   const hiveProbe = await probeJson<HiveNodeInfo>(`http://127.0.0.1:${ORC_HIVE_PORT}/hive/info`);
   const tailscale = await getTailscaleStatus();
@@ -550,10 +733,16 @@ app.get("/api/companion-node/status", async (_req, res) => {
       kind: route.kind,
       label: route.label,
       host: route.host,
+      trustState: getPeerForRoute(knownPeers, route)?.trustState ?? "unpaired_observer",
     })),
     ollama: {
       reachable: ollamaProbe.ok,
       modelCount: ollamaProbe.ok ? (ollamaProbe.data.models ?? []).length : 0,
+    },
+    trustSurface: {
+      localControlEnabled: false,
+      remoteServerEnforcementKnown: false,
+      observerOnly: true,
     },
     installState: summarizeInstallState(setup, {
       configuredHost,
@@ -572,6 +761,7 @@ app.get("/api/companion-node/jobs", (_req, res) => {
 
 app.get("/api/companion-node/setup", async (_req, res) => {
   const setup = await readCompanionSetupSettings();
+  const knownPeers = await readKnownHivePeers();
   const tailscale = await getTailscaleStatus();
   const configuredHost = getConfiguredOrcHost();
   const localHive = await probeJson<HiveNodeInfo>(`http://127.0.0.1:${ORC_HIVE_PORT}/hive/info`);
@@ -594,6 +784,11 @@ app.get("/api/companion-node/setup", async (_req, res) => {
       localHiveReachable: localHive.ok,
       localOllamaReachable: localOllama.ok,
     }),
+    hiveTrust: {
+      knownPeerCount: knownPeers.length,
+      approvedPeerCount: knownPeers.filter((peer) => peer.trustState !== "unpaired_observer" && peer.trustState !== "blocked_untrusted").length,
+      serverEnforcementKnown: knownPeers.some((peer) => peer.serverEnforcementKnown),
+    },
   });
 });
 
@@ -650,6 +845,7 @@ app.post("/api/companion-node/jobs", async (req, res) => {
 
 app.get("/api/hive/network-targets", async (_req, res) => {
   const configuredHost = getConfiguredOrcHost();
+  const knownPeers = await readKnownHivePeers();
   const routes = getRouteCandidates().sort((left, right) => {
     const score = (route: RouteCandidate) => {
       if (configuredHost && route.host === configuredHost) return 100;
@@ -665,6 +861,7 @@ app.get("/api/hive/network-targets", async (_req, res) => {
 
   const localProbe = await probeJson<HiveNodeInfo>(`http://127.0.0.1:${ORC_HIVE_PORT}/hive/info`);
   const ollamaProbe = await probeJson<{ models?: Array<{ name?: string }> }>(`http://127.0.0.1:${ORC_OLLAMA_PORT}/api/tags`);
+  const observations = routes.map((route) => buildObservationFromRoute(route, getPeerForRoute(knownPeers, route)));
 
   res.json({
     companion: {
@@ -674,13 +871,98 @@ app.get("/api/hive/network-targets", async (_req, res) => {
         companionUrl: `http://${route.host}:${PORT}`,
         hiveInfoUrl: `http://${route.host}:${ORC_HIVE_PORT}/hive/info`,
         ollamaUrl: `http://${route.host}:${ORC_OLLAMA_PORT}`,
+        trustState: getPeerForRoute(knownPeers, route)?.trustState ?? "unpaired_observer",
+        visibilityState: visibilityStateForTrust(getPeerForRoute(knownPeers, route)?.trustState ?? "unpaired_observer"),
+        serverEnforcementKnown: getPeerForRoute(knownPeers, route)?.serverEnforcementKnown ?? false,
       })),
     },
     tailscale,
     configuredHost,
     localHive: localProbe.ok ? localProbe.data : null,
     localOllamaReachable: ollamaProbe.ok,
+    observations,
+    knownPeers,
+    protocol: {
+      protocolVersion: "hive-pairing-prep-v1",
+      clientRole: "companion_observer",
+      observerOnly: true,
+      controlEnabled: false,
+    },
   });
+});
+
+app.post("/api/hive/prepare-pairing", async (req, res) => {
+  const host = normalizeTargetHost(String(req.body?.host ?? ""));
+  const mode = String(req.body?.mode ?? "approved_candidate") as HiveLocalDecision;
+  const routeKind = (String(req.body?.kind ?? "manual") as RouteKind | "manual");
+  if (!host) {
+    res.status(400).json({ error: "Provide a host to prepare pairing for." });
+    return;
+  }
+  if (!["approved_candidate", "paired_placeholder", "revoked"].includes(mode)) {
+    res.status(400).json({ error: "Unsupported pairing preparation mode." });
+    return;
+  }
+
+  const peers = await readKnownHivePeers();
+  const peerId = peerIdForHost(host);
+  const now = new Date().toISOString();
+  const route: HivePeerRouteRecord = {
+    kind: routeKind === "manual" ? "lan" : routeKind,
+    label: routeKind === "manual" ? `Manual ${host}` : `${routeKind.toUpperCase()} ${host}`,
+    host,
+  };
+  const existing = peers.find((peer) => peer.peerId === peerId);
+  if (existing) {
+    existing.displayName = String(req.body?.displayName ?? existing.displayName);
+    existing.localDecision = mode;
+    existing.trustState = trustStateForDecision(mode);
+    existing.lastSeenAt = now;
+    if (!existing.routes.some((knownRoute) => knownRoute.host === host)) {
+      existing.routes.push(route);
+    }
+  } else {
+    peers.push({
+      peerId,
+      displayName: String(req.body?.displayName ?? host),
+      routes: [route],
+      firstSeenAt: now,
+      lastSeenAt: now,
+      trustState: trustStateForDecision(mode),
+      localDecision: mode,
+      protocolVersion: "hive-pairing-prep-v1",
+      serverEnforcementKnown: false,
+      peerIdentityKey: "",
+    });
+  }
+
+  await writeKnownHivePeers(peers);
+  res.json({
+    ok: true,
+    peer: peers.find((peer) => peer.peerId === peerId) ?? null,
+    note: "Local trust intent saved. Remote HIVE enforcement is still unknown.",
+  });
+});
+
+app.post("/api/hive/revoke-peer", async (req, res) => {
+  const host = normalizeTargetHost(String(req.body?.host ?? ""));
+  if (!host) {
+    res.status(400).json({ error: "Provide a host to revoke." });
+    return;
+  }
+
+  const peers = await readKnownHivePeers();
+  const peer = peers.find((entry) => entry.peerId === peerIdForHost(host));
+  if (!peer) {
+    res.status(404).json({ error: "Peer was not found." });
+    return;
+  }
+
+  peer.localDecision = "revoked";
+  peer.trustState = "blocked_untrusted";
+  peer.lastSeenAt = new Date().toISOString();
+  await writeKnownHivePeers(peers);
+  res.json({ ok: true, peer });
 });
 
 app.post("/api/hive/test-connection", async (req, res) => {
@@ -693,6 +975,11 @@ app.post("/api/hive/test-connection", async (req, res) => {
 
   const hiveInfoUrl = `http://${host}:${ORC_HIVE_PORT}/hive/info`;
   const ollamaTagsUrl = `http://${host}:${ORC_OLLAMA_PORT}/api/tags`;
+  const knownPeers = await readKnownHivePeers();
+  const route = getRouteCandidates().find((candidate) => candidate.host === host) ?? { kind: "lan" as const, label: `Manual ${host}`, host };
+  const peer = getPeerForRoute(knownPeers, route);
+  const trustState = peer?.trustState ?? "unpaired_observer";
+  const protocolContext = protocolContextForPeer(peer?.peerId ?? peerIdForHost(host), trustState);
 
   const [hiveProbe, ollamaProbe] = await Promise.all([
     probeJson<HiveNodeInfo>(hiveInfoUrl),
@@ -727,13 +1014,16 @@ app.post("/api/hive/test-connection", async (req, res) => {
   const status = summarizeStatus(Boolean(hiveData), ollamaProbe.ok);
   const testLog = [
     `Resolving target host ${host}...`,
+    `Companion trust posture: ${trustState}. Observer-only mode; no control actions attempted.`,
     hiveProbe.ok
       ? `HIVE node API responded in ${hiveProbe.latencyMs}ms from ${hiveInfoUrl}`
       : `HIVE node API unavailable at ${hiveInfoUrl}: ${hiveError}`,
     ollamaProbe.ok
       ? `Ollama responded in ${ollamaProbe.latencyMs}ms from ${ollamaTagsUrl}`
       : `Ollama unavailable at ${ollamaTagsUrl}: ${ollamaError}`,
-  ];
+    ];
+
+  await upsertObservedHivePeer(route, hiveData?.Name);
 
   res.json({
     targetHost: host,
@@ -753,7 +1043,77 @@ app.post("/api/hive/test-connection", async (req, res) => {
       modelCount: ollamaModels.length,
       models: ollamaModels.slice(0, 12),
     },
+    trustState,
+    visibilityState: visibilityStateForTrust(trustState),
+    serverEnforcementKnown: peer?.serverEnforcementKnown ?? false,
+    protocolContext,
     testLog,
+  });
+});
+
+app.post("/api/hive/run-observer-diagnostics", async (req, res) => {
+  const host = normalizeTargetHost(String(req.body?.host ?? ""));
+  if (!host) {
+    res.status(400).json({ error: "Provide a host to inspect." });
+    return;
+  }
+
+  const route = getRouteCandidates().find((candidate) => candidate.host === host);
+  const knownPeers = await readKnownHivePeers();
+  const peer = route ? getPeerForRoute(knownPeers, route) : undefined;
+  const trustState = peer?.trustState ?? "unpaired_observer";
+  const protocolContext = protocolContextForPeer(peer?.peerId ?? peerIdForHost(host), trustState);
+  const hiveInfoUrl = `http://${host}:${ORC_HIVE_PORT}/hive/info`;
+  const ollamaTagsUrl = `http://${host}:${ORC_OLLAMA_PORT}/api/tags`;
+  const [hiveProbe, ollamaProbe] = await Promise.all([
+    probeJson<HiveNodeInfo>(hiveInfoUrl),
+    probeJson<{ models?: Array<{ name?: string }> }>(ollamaTagsUrl),
+  ]);
+
+  const diagnosticsEntry: HiveObserverDiagnosticsRecord = {
+    id: `diag-${Date.now()}`,
+    createdAt: new Date().toISOString(),
+    targetHost: host,
+    routeKind: route?.kind ?? "manual",
+    protocolContext,
+    discoverableEndpoints: [
+      hiveInfoUrl,
+      ollamaTagsUrl,
+      `http://${host}:${PORT}`,
+    ],
+    metadataExposure: {
+      hiveReachable: hiveProbe.ok,
+      ollamaReachable: ollamaProbe.ok,
+      hiveName: hiveProbe.ok ? hiveProbe.data.Name : undefined,
+      laneCount: hiveProbe.ok ? hiveProbe.data.Lanes.length : 0,
+      modelCount: ollamaProbe.ok ? (ollamaProbe.data.models ?? []).length : 0,
+    },
+    refusedOperations: [
+      "auto_enroll",
+      "task_claim",
+      "result_submit",
+      "auto_trust_promotion",
+    ],
+    notes: [
+      `Trust state remained ${trustState}.`,
+      "Diagnostics are observer-only and never attempt claim, submit, or enrollment flows.",
+      peer?.serverEnforcementKnown
+        ? "Remote enforcement marker exists."
+        : "Remote server enforcement is still unknown from the Companion side.",
+    ],
+  };
+
+  const diagnostics = await readObserverDiagnostics();
+  diagnostics.unshift(diagnosticsEntry);
+  await writeObserverDiagnostics(diagnostics);
+  res.json({ ok: true, diagnostics: diagnosticsEntry });
+});
+
+app.get("/api/hive/observer-diagnostics", async (_req, res) => {
+  const diagnostics = await readObserverDiagnostics();
+  res.json({
+    protocolVersion: "hive-pairing-prep-v1",
+    diagnostics,
   });
 });
 
@@ -998,6 +1358,41 @@ app.post("/api/hivemind/process-task", async (req, res) => {
 });
 
 // REST API for HIvEMIND Chat & Research
+app.post("/api/agent/tools/web_search", async (req, res) => {
+  const query = String(req.body?.query ?? "").trim();
+  if (!query) {
+    res.status(400).json({ error: "No search query was provided." });
+    return;
+  }
+
+  try {
+    const maxResults = Number(req.body?.maxResults ?? 5);
+    const results = await webSearch({ query, maxResults: Number.isFinite(maxResults) ? maxResults : 5 });
+    res.json({
+      query,
+      markdown: formatWebSearchForLlm(query, results),
+      results,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "Web search failed." });
+  }
+});
+
+app.post("/api/agent/tools/fetch_page", async (req, res) => {
+  const url = String(req.body?.url ?? "").trim();
+  if (!url) {
+    res.status(400).json({ error: "No URL was provided." });
+    return;
+  }
+
+  try {
+    const result = await fetchPage({ url, allowPrivateHosts: true });
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: error?.message || "Page fetch failed." });
+  }
+});
+
 app.post("/api/hivemind/research", async (req, res) => {
   const { query } = req.body;
 

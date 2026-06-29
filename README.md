@@ -98,6 +98,33 @@ Current built-in job types:
 
 Those are intentionally narrow, useful, and cheap enough to fit a helper-node model.
 
+### Local agent tools (chat)
+
+The Chat tab can run a **local tool-calling loop** on Android without cloud API keys:
+
+- `web_search` — DuckDuckGo HTML search (no API key)
+- `fetch_page` — fetch and summarize a public URL
+- `get_device_profile` — battery, time, device model, owner name
+- `get_hive_status` — probe the selected HIVE route when the companion server is reachable
+- `queue_scrape_url` — queue a background scrape job on the companion server
+
+Settings:
+
+- **Agent tools** — on by default; uses prompt-based JSON tool calls with the loaded local model
+- **Web search + page fetch** — network gate for search/scrape tools
+
+Limits:
+
+- Tools run in the app layer so packaged Android builds work standalone
+- DuckDuckGo HTML scraping can rate-limit; results are not JavaScript-rendered
+- Qwen2.5 1.5B is more reliable for tool JSON than Qwen3 0.6B
+- HIVE/job tools need the dev server or `VITE_API_BASE`; search/fetch work on-device
+
+Dev-only debug endpoints (when `npm run dev` is running):
+
+- `POST /api/agent/tools/web_search` `{ "query": "..." }`
+- `POST /api/agent/tools/fetch_page` `{ "url": "https://..." }`
+
 ---
 
 ## HIVE Shape
@@ -174,13 +201,28 @@ The debug APK lands at:
 
 `android/app/build/outputs/apk/debug/app-debug.apk`
 
-### Important note about the current Android flow
+### Development server override
 
-The Android shell currently points at the local desktop-backed server URL defined in:
+Android builds now use packaged web assets by default, so release builds are not pinned to a desktop or Tailscale URL.
 
-[`capacitor.config.ts`](capacitor.config.ts)
+For live development against the Vite/dev server, set `CAP_SERVER_URL` before syncing:
 
-That means the phone is meant to talk back to a live desktop TheOrc Companion server during development. If you move to another machine or another Tailscale IP, update that URL before syncing again.
+```powershell
+$env:CAP_SERVER_URL="http://192.168.1.227:3000"
+npm run android:sync
+```
+
+Clear that variable and sync again before release packaging.
+
+### Release build
+
+```powershell
+npm run android:sync
+cd android
+.\gradlew.bat assembleRelease
+```
+
+Release signing still needs a real keystore before Play/internal distribution. Add signing material through Android Studio or local Gradle properties; do not commit keys, passwords, or generated `local.properties`.
 
 ---
 
@@ -188,8 +230,10 @@ That means the phone is meant to talk back to a live desktop TheOrc Companion se
 
 | Path | Purpose |
 |---|---|
-| `src/App.tsx` | Main dashboard tabs and top-level app layout |
-| `src/components/AndroidCompanionHub.tsx` | Real companion setup, route testing, and edge-job UI |
+| `src/App.tsx` | Main dashboard tabs, local chat agent, and top-level app layout |
+| `src/lib/agent/` | Local tool-calling loop and tool registry |
+| `src/lib/tools/` | DuckDuckGo search, page fetch, device/HIVE tool helpers |
+| `src/components/AndroidCompanionHub.tsx` | Legacy companion setup UI (not mounted in current App) |
 | `server.ts` | Discovery, probing, setup persistence, and companion-node job queue |
 | `android/` | Capacitor Android wrapper project |
 | `assets/` | README branding and companion visuals |
@@ -204,13 +248,18 @@ This project is no longer just the stock AI Studio export. It now has:
 - real HIVE and Ollama probing
 - persisted first-run setup
 - Android packaging and deployment
+- native LiteRT-LM download, load, stream, cancel, unload, and delete plumbing
+- local chat agent tools with DuckDuckGo search and page fetch (no cloud search API)
+- a public first-run default model: Qwen3 0.6B Mixed INT4 for LiteRT-LM
 - a companion-node job queue aligned with TheOrc role architecture
 
 What it does **not** claim yet:
 
 - full distributed HIVE task execution from TheOrc
 - autonomous mobile inference scheduling
-- production-ready offline Android-native API handling
+- measured S23 performance/thermal tuning
+- production signing
+- broad local model catalog support
 
 That honesty matters. The companion is now useful, but it is still in the "groundwork and field-node bring-up" phase.
 
@@ -223,8 +272,10 @@ The strongest next upgrades are:
 - signed work packets from TheOrc into the companion queue
 - capability heartbeat reporting back to HIVE
 - route auto-selection between LAN and Tailscale
-- tighter Android-native handling for setup, battery gating, and background-safe node behavior
-- tiny local model adapters for file triage, rename suggestion, and slow scrape summarization
+- validate LiteRT-LM download/load/chat/cancel on the S23
+- add production release signing
+- add optional licensed Gemma models after the in-app model catalog can handle gated downloads cleanly
+- optional native LiteRT `@Tool` providers once a tool-capable on-device model is added
 
 ---
 
