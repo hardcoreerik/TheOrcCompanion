@@ -4,6 +4,7 @@ const config: CapacitorConfig = {
   appId: "com.hardcoreerik.theorccompanion",
   appName: "TheOrc Companion",
   webDir: "dist",
+  plugins: { CapacitorHttp: { enabled: true } },
   server: process.env.CAP_SERVER_URL
     ? {
         androidScheme: "http",

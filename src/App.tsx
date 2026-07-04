@@ -51,7 +51,7 @@ import { runAgentLoop } from "./lib/agent/runAgentLoop";
 import { executeTool, toolActivityLabel } from "./lib/agent/toolRegistry";
 import type { SourceReference, ToolActivityEntry } from "./lib/agent/types";
 import { HiveWorkerAgentClient } from "./lib/hive/workerAgent";
-import { approveRemoteAction, closeRemoteTerminal, confirmPairedNode, getCompanionNodeId, getControlStatus, getPairedNode, openRemoteTerminal, pairWithNode, readRemoteTerminal, revokePairedNode, runRemoteTask, writeRemoteTerminal, type HiveTopologyNode } from "./lib/hive/controlClient";
+import { confirmPairedNode, forgetPairedNode, getCompanionNodeId, getControlStatus, getPairedNode, pairWithNode, runRemoteTask, type HiveTopologyNode } from "./lib/hive/controlClient";
 import companionIcon from "../assets/02_app_icon.png";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
@@ -1746,7 +1746,7 @@ export default function App() {
 
   async function unpairActiveNode() {
     if (!activeRoute) return;
-    await revokePairedNode(activeRoute.host);
+    await forgetPairedNode(activeRoute.host);
     setControlStatus(null);
     setControlError("");
   }
@@ -2436,7 +2436,7 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
           <div className="flex items-center justify-between gap-2">
             <div>
               <h3 className="text-sm font-black text-cyan-100">Remote control</h3>
-              <p className="text-xs text-cyan-200/70">Pair once, then command this node (including the Warchief) directly from the phone.</p>
+              <p className="text-xs text-cyan-200/70">Pair once, then send work to this HIVE and follow the result from your phone.</p>
             </div>
             <span className={`rounded-full border px-2 py-1 text-xs font-bold ${isPairedWithActiveNode ? "border-lime-400/40 text-lime-200" : "border-zinc-700 text-zinc-400"}`}>
               {isPairedWithActiveNode ? "Paired" : "Not paired"}
@@ -2473,17 +2473,16 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
               <textarea
                 value={remoteCommandSpec}
                 onChange={(event) => onRemoteCommandSpec(event.target.value)}
-                placeholder="PowerShell command to run on this paired node"
+                placeholder="Describe the task for the HIVE"
                 rows={2}
                 className="w-full resize-none rounded-md border border-cyan-400/30 bg-black px-3 py-2 text-sm text-cyan-50 outline-none"
               />
               <button onClick={onRunRemoteCommand} disabled={controlBusy || !remoteCommandSpec.trim()} className="w-full rounded-md bg-cyan-400 px-3 py-3 text-sm font-black text-black disabled:opacity-40">
-                {controlBusy ? "Running on node..." : "Run command"}
+                {controlBusy ? "Running in HIVE..." : "Send to HIVE"}
               </button>
               {remoteCommandResult && (
                 <div className="rounded-md border border-cyan-400/20 bg-black/30 p-2 text-xs text-cyan-50 whitespace-pre-wrap">{remoteCommandResult}</div>
               )}
-              <RemoteTerminal host={activeRoute.host} />
             </div>
           )}
         </div>
@@ -2604,63 +2603,6 @@ function HiveConstellation({ topology }: { topology: { center: HiveTopologyNode;
           </g>;
         })}
       </svg>
-    </div>
-  );
-}
-
-function RemoteTerminal({ host }: { host: string }) {
-  const [terminalId, setTerminalId] = useState("");
-  const [status, setStatus] = useState("closed");
-  const [output, setOutput] = useState("");
-  const [offset, setOffset] = useState(0);
-  const [input, setInput] = useState("");
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    if (!terminalId || !["open", "awaiting_approval"].includes(status)) return;
-    const timer = window.setInterval(async () => {
-      try {
-        const snapshot = await readRemoteTerminal(host, terminalId, offset);
-        if (snapshot.output) setOutput((current) => current + snapshot.output);
-        setOffset(snapshot.offset);
-        setStatus(snapshot.status);
-      } catch (e: any) { setError(e?.message || "Terminal polling failed."); }
-    }, 750);
-    return () => window.clearInterval(timer);
-  }, [host, terminalId, offset, status]);
-
-  async function open() {
-    setError(""); setOutput(""); setOffset(0);
-    try {
-      const terminal = await openRemoteTerminal(host);
-      if (!window.confirm(`Open an interactive PowerShell session on ${host}?`)) {
-        await approveRemoteAction(host, terminal.id, false); return;
-      }
-      await approveRemoteAction(host, terminal.id, true);
-      setTerminalId(terminal.id); setStatus("open");
-    } catch (e: any) { setError(e?.message || "Unable to open terminal."); }
-  }
-
-  async function send() {
-    if (!terminalId || !input.trim()) return;
-    await writeRemoteTerminal(host, terminalId, input);
-    setInput("");
-  }
-
-  async function close() {
-    if (terminalId) await closeRemoteTerminal(host, terminalId).catch(() => undefined);
-    setTerminalId(""); setStatus("closed");
-  }
-
-  return (
-    <div className="space-y-2 border-t border-cyan-400/20 pt-3">
-      <div className="flex items-center justify-between"><strong className="text-xs text-cyan-100">Interactive terminal</strong><span className="text-xs text-zinc-500">{status}</span></div>
-      {!terminalId ? <button onClick={() => void open()} className="w-full rounded-md border border-cyan-400/40 px-3 py-2 text-xs font-bold text-cyan-100">Open terminal</button> : <>
-        <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-zinc-800 bg-black p-2 text-xs text-lime-200">{output || "PowerShell ready."}</pre>
-        <div className="flex gap-2"><input value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void send(); }} className="min-w-0 flex-1 rounded-md border border-zinc-700 bg-black px-2 py-2 text-xs text-zinc-100" placeholder="Enter command" /><button onClick={() => void send()} className="rounded-md bg-cyan-400 px-3 text-xs font-black text-black">Send</button></div>
-        <button onClick={() => void close()} className="w-full rounded-md border border-red-500/30 px-3 py-2 text-xs font-bold text-red-200">Close terminal</button>
-      </>}
-      {error && <p className="text-xs text-red-300">{error}</p>}
     </div>
   );
 }

@@ -1,7 +1,9 @@
 import { Capacitor, registerPlugin } from "@capacitor/core";
 
-const CONTROL_PORT = 7078;
+const NODE_PORT = 7078;
+const TASK_PORT = 7079;
 const PEERS_KEY = "orc-companion-hive-peers";
+const hiveFetch = (input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, signal: AbortSignal.timeout(10_000) });
 
 interface HiveIdentityNative {
   getIdentity(): Promise<{ nodeId: string; signingPublicKeyDer: string; exchangePublicKeyDer: string }>;
@@ -9,8 +11,6 @@ interface HiveIdentityNative {
   trustPeer(options: { nodeId: string; signingPublicKeyDer: string; exchangePublicKeyDer: string; hiveId?: string }): Promise<{ nodeId: string }>;
   forgetPeer(options: { nodeId: string }): Promise<void>;
   signRequest(options: { nodeId: string; method: string; path: string; body: string }): Promise<Record<string, string>>;
-  encryptControl(options: { nodeId: string; json: string }): Promise<ControlEnvelope>;
-  decryptControl(options: ControlEnvelope & { nodeId: string }): Promise<{ json: string }>;
 }
 
 const HiveIdentity = registerPlugin<HiveIdentityNative>("HiveIdentity");
@@ -29,12 +29,24 @@ export interface PendingPairing extends PairedNode {
   hiveId?: string;
 }
 
-interface ControlEnvelope { nonce: string; ciphertext: string; tag: string }
-interface CommandSnapshot { id: string; status: string; output: string; exitCode?: number; error?: string }
-export interface TerminalSnapshot { id: string; status: string; output: string; offset: number; exitCode?: number; error?: string }
+export interface HiveTopologyNode {
+  nodeId: string;
+  name: string;
+  role: string;
+  state: "online" | "offline";
+  isMobile: boolean;
+}
+
+interface TaskStatus {
+  taskId: string;
+  status: string;
+  result?: string;
+  errorMsg?: string;
+  claimedBy?: string;
+}
 
 function requireAndroid() {
-  if (Capacitor.getPlatform() !== "android") throw new Error("HIVE remote control is available in the Android app only.");
+  if (Capacitor.getPlatform() !== "android") throw new Error("HIVE control is available in the Android app only.");
 }
 
 function peers(): PairedNode[] {
@@ -55,24 +67,17 @@ export async function forgetPairedNode(host: string) {
   localStorage.setItem(PEERS_KEY, JSON.stringify(peers().filter((item) => item.host !== host)));
 }
 
-export async function revokePairedNode(host: string) {
-  const peer = getPairedNode(host);
-  if (!peer) return;
-  await controlRequest(host, "DELETE", "/hive/control/pairing");
-  await forgetPairedNode(host);
-}
-
 export async function pairWithNode(host: string, label: string): Promise<PendingPairing> {
   requireAndroid();
   const request = await HiveIdentity.createPairingRequest({ name: label });
-  const response = await fetch(`http://${host}:${CONTROL_PORT}/hive/pair`, {
+  const response = await hiveFetch(`http://${host}:${NODE_PORT}/hive/pair`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
   });
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `Pairing failed with HTTP ${response.status}`);
   const sessionId = String(request.sessionId);
   for (let attempt = 0; attempt < 60; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 2_000));
-    const poll = await fetch(`http://${host}:${CONTROL_PORT}/hive/pair/${sessionId}`);
+    const poll = await hiveFetch(`http://${host}:${NODE_PORT}/hive/pair/${sessionId}`);
     const result = await poll.json();
     if (result.status === "pending") continue;
     if (result.status !== "approved") throw new Error(`Pairing ${result.status || "failed"}.`);
@@ -102,21 +107,6 @@ export async function confirmPairedNode(pending: PendingPairing): Promise<Paired
   return peer;
 }
 
-async function controlRequest<T>(host: string, method: string, path: string, value?: unknown): Promise<T> {
-  requireAndroid();
-  const peer = getPairedNode(host);
-  if (!peer) throw new Error(`Not paired with ${host}.`);
-  const body = value === undefined ? "" : JSON.stringify(await HiveIdentity.encryptControl({ nodeId: peer.nodeId, json: JSON.stringify(value) }));
-  const headers = await HiveIdentity.signRequest({ nodeId: peer.nodeId, method, path: path.split("?", 1)[0], body });
-  const response = await fetch(`http://${host}:${CONTROL_PORT}${path}`, {
-    method, headers: { ...headers, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body || undefined,
-  });
-  if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `Control request failed with HTTP ${response.status}`);
-  const envelope = await response.json() as ControlEnvelope;
-  const decrypted = await HiveIdentity.decryptControl({ nodeId: peer.nodeId, ...envelope });
-  return JSON.parse(decrypted.json) as T;
-}
-
 export async function signedHiveHeaders(host: string, method: string, path: string, body = "") {
   requireAndroid();
   const peer = getPairedNode(host);
@@ -124,21 +114,31 @@ export async function signedHiveHeaders(host: string, method: string, path: stri
   return HiveIdentity.signRequest({ nodeId: peer.nodeId, method, path, body });
 }
 
-export function getControlStatus(host: string) {
-  return controlRequest<{
-    nodeName: string;
-    info: { name: string; models: string[]; lanes: string[] };
-    topology: { center: HiveTopologyNode; peers: HiveTopologyNode[] };
-    timestamp: string;
-  }>(host, "GET", "/hive/control");
+async function taskRequest<T>(host: string, method: string, path: string, value?: unknown): Promise<T> {
+  const body = value === undefined ? "" : JSON.stringify(value);
+  const headers = await signedHiveHeaders(host, method, path, body);
+  const response = await hiveFetch(`http://${host}:${TASK_PORT}${path}`, {
+    method,
+    headers: { ...headers, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body || undefined,
+  });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `HIVE request failed with HTTP ${response.status}`);
+  return response.json() as Promise<T>;
 }
 
-export interface HiveTopologyNode {
-  nodeId: string;
-  name: string;
-  role: string;
-  state: "online" | "offline";
-  isMobile: boolean;
+export async function getControlStatus(host: string) {
+  const response = await hiveFetch(`http://${host}:${NODE_PORT}/hive/info`);
+  if (!response.ok) throw new Error(`HIVE status failed with HTTP ${response.status}`);
+  const info = await response.json() as { Name: string; Models?: string[]; Lanes?: string[] };
+  const peer = getPairedNode(host);
+  const center: HiveTopologyNode = {
+    nodeId: peer?.nodeId ?? host,
+    name: info.Name,
+    role: "warchief",
+    state: "online",
+    isMobile: false,
+  };
+  return { nodeName: info.Name, info: { models: info.Models ?? [], lanes: info.Lanes ?? [] }, topology: { center, peers: [] } };
 }
 
 export async function getCompanionNodeId() {
@@ -146,34 +146,21 @@ export async function getCompanionNodeId() {
   return (await HiveIdentity.getIdentity()).nodeId;
 }
 
-export async function runRemoteTask(host: string, command: string): Promise<{ result: string; model: string; durationMs: number }> {
+export async function runRemoteTask(host: string, spec: string): Promise<{ result: string; model: string; durationMs: number }> {
   const started = Date.now();
-  let run = await controlRequest<CommandSnapshot>(host, "POST", "/hive/control/commands", { command, reason: "Requested from paired Companion" });
-  if (!window.confirm(`Allow this command on ${host}?\n\n${command}`)) {
-    await controlRequest(host, "POST", `/hive/control/approvals/${run.id}/decision`, { approved: false });
-    throw new Error("Command rejected.");
-  }
-  await controlRequest(host, "POST", `/hive/control/approvals/${run.id}/decision`, { approved: true });
-  while (["pending", "awaiting_approval", "running"].includes(run.status)) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    run = await controlRequest<CommandSnapshot>(host, "GET", `/hive/control/commands/${run.id}`);
-  }
-  if (run.status !== "complete") throw new Error(run.error || `Command ${run.status}.`);
-  return { result: run.output, model: "powershell", durationMs: Date.now() - started };
-}
+  const submitted = await taskRequest<{ taskId: string }>(host, "POST", "/hive/tasks/submit", {
+    role: "Researcher",
+    title: spec.split("\n", 1)[0].slice(0, 80) || "Companion request",
+    spec,
+    projectGoal: "Requested remotely from TheOrc Companion",
+    timeoutMs: 300_000,
+  });
 
-export function openRemoteTerminal(host: string, cwd?: string) {
-  return controlRequest<TerminalSnapshot>(host, "POST", "/hive/control/terminals", { cwd, reason: "Interactive Companion terminal" });
-}
-export function approveRemoteAction(host: string, id: string, approved: boolean) {
-  return controlRequest(host, "POST", `/hive/control/approvals/${id}/decision`, { approved });
-}
-export function readRemoteTerminal(host: string, id: string, offset: number) {
-  return controlRequest<TerminalSnapshot>(host, "GET", `/hive/control/terminals/${id}?offset=${offset}`);
-}
-export function writeRemoteTerminal(host: string, id: string, input: string) {
-  return controlRequest(host, "POST", `/hive/control/terminals/${id}/input`, { input });
-}
-export function closeRemoteTerminal(host: string, id: string) {
-  return controlRequest(host, "DELETE", `/hive/control/terminals/${id}`);
+  for (let attempt = 0; attempt < 600; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    const task = await taskRequest<TaskStatus>(host, "GET", `/hive/tasks/${submitted.taskId}`);
+    if (task.status === "completed") return { result: task.result ?? "Task completed.", model: task.claimedBy ?? "HIVE", durationMs: Date.now() - started };
+    if (!["pending", "claimed", "verifying"].includes(task.status)) throw new Error(task.errorMsg || `HIVE task ${task.status}.`);
+  }
+  throw new Error("HIVE task timed out after 5 minutes.");
 }

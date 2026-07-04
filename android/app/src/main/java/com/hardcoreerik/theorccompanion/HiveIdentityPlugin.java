@@ -39,7 +39,6 @@ public class HiveIdentityPlugin extends Plugin {
     private static final String SIGNING = "hive-signing-p256";
     private static final String EXCHANGE = "hive-exchange-p256";
     private static final String STORAGE = "hive-peer-storage-aes";
-    private static final byte[] CONTROL_INFO = "hive-control-v1".getBytes(StandardCharsets.UTF_8);
     private final SecureRandom random = new SecureRandom();
 
     @PluginMethod
@@ -121,38 +120,6 @@ public class HiveIdentityPlugin extends Plugin {
         } catch (Exception e) { call.reject(e.getMessage(), e); }
     }
 
-    @PluginMethod
-    public void encryptControl(PluginCall call) {
-        try {
-            byte[] key = controlKey(required(call, "nodeId"));
-            byte[] nonce = new byte[12]; random.nextBytes(nonce);
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.ENCRYPT_MODE, new SecretKeySpec(key, "AES"), new GCMParameterSpec(128, nonce));
-            cipher.updateAAD(CONTROL_INFO);
-            byte[] combined = cipher.doFinal(required(call, "json").getBytes(StandardCharsets.UTF_8));
-            byte[] ciphertext = java.util.Arrays.copyOf(combined, combined.length - 16);
-            byte[] tag = java.util.Arrays.copyOfRange(combined, combined.length - 16, combined.length);
-            call.resolve(new JSObject().put("nonce", b64(nonce)).put("ciphertext", b64(ciphertext)).put("tag", b64(tag)));
-        } catch (Exception e) { call.reject(e.getMessage(), e); }
-    }
-
-    @PluginMethod
-    public void decryptControl(PluginCall call) {
-        try {
-            byte[] nonce = Base64.decode(required(call, "nonce"), Base64.DEFAULT);
-            byte[] ciphertext = Base64.decode(required(call, "ciphertext"), Base64.DEFAULT);
-            byte[] tag = Base64.decode(required(call, "tag"), Base64.DEFAULT);
-            byte[] combined = new byte[ciphertext.length + tag.length];
-            System.arraycopy(ciphertext, 0, combined, 0, ciphertext.length);
-            System.arraycopy(tag, 0, combined, ciphertext.length, tag.length);
-            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
-            cipher.init(Cipher.DECRYPT_MODE, new SecretKeySpec(controlKey(required(call, "nodeId")), "AES"), new GCMParameterSpec(128, nonce));
-            cipher.updateAAD(CONTROL_INFO);
-            String json = new String(cipher.doFinal(combined), StandardCharsets.UTF_8);
-            call.resolve(new JSObject().put("json", json));
-        } catch (Exception e) { call.reject(e.getMessage(), e); }
-    }
-
     private JSObject identityJson() throws Exception {
         KeyPair signing = keyPair(SIGNING, KeyProperties.PURPOSE_SIGN | KeyProperties.PURPOSE_VERIFY);
         KeyPair exchange = keyPair(EXCHANGE, KeyProperties.PURPOSE_AGREE_KEY);
@@ -203,10 +170,6 @@ public class HiveIdentityPlugin extends Plugin {
         Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
         cipher.init(Cipher.DECRYPT_MODE, storageKey(), new GCMParameterSpec(128, Base64.decode(parts[0], Base64.DEFAULT)));
         return cipher.doFinal(Base64.decode(parts[1], Base64.DEFAULT));
-    }
-
-    private byte[] controlKey(String nodeId) throws Exception {
-        return hkdf(loadSecret(nodeId), "TheOrc.HIVE.Control".getBytes(StandardCharsets.UTF_8), CONTROL_INFO);
     }
 
     private SharedPreferences preferences() { return getContext().getSharedPreferences(STORE, 0); }
