@@ -1231,7 +1231,8 @@ export default function App() {
     setIsGenerating(true);
     setMessages((current) => [...current, userMessage, assistantMessage]);
 
-    if (agentToolsEnabled && searchMode !== "local" && toolCapability === "capable") {
+    // ponytail: its full native tool schema exceeds the current 512-token engine limit.
+    if (agentToolsEnabled && searchMode !== "local" && toolCapability === "capable" && loadedModel.id !== "qwen2.5-1.5b-instruct-litert") {
       armPrimaryGenerationWatchdog();
       try {
         await LocalLlm.startGeneration({
