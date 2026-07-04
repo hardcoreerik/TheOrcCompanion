@@ -230,6 +230,28 @@ public class LocalLlmPlugin extends Plugin {
             )
         );
         MODEL_SPECS.put(
+            "smolvlm2-500m-litert",
+            new ModelSpec(
+                "smolvlm2-500m-litert",
+                "SmolVLM2 500M Vision",
+                "SmolVLM2-500M.litertlm",
+                "https://huggingface.co/litert-community/SmolVLM2-500M/resolve/main/SmolVLM2-500M.litertlm",
+                "0dfb6fb881eb16e5ef2b2be04de5476caf939b7d9ae601fdee308bbc5462fd55",
+                BACKEND_LITERT,
+                "Instruction tuned",
+                "Experimental 361 MB vision-language model. Downloadable now; image understanding requires vision runtime support.",
+                2_147_483_648L,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                361_052_336L
+            )
+        );
+        MODEL_SPECS.put(
             "qwen3-1.7b-litert",
             new ModelSpec(
                 "qwen3-1.7b-litert",

@@ -3,7 +3,6 @@ import {
   Bot,
   CheckCircle2,
   Copy,
-  Cpu,
   Download,
   Edit3,
   GitBranch,
@@ -161,6 +160,7 @@ const SETUP_STORAGE_KEY = "orc-companion-setup-complete";
 const DEV_MODE_STORAGE_KEY = "orc-companion-dev-mode";
 const BACKEND_POLICY_KEY = "orc-companion-backend-policy";
 const PREFERRED_MODEL_KEY = "orc-companion-preferred-model";
+const LAST_LOADED_MODEL_KEY = "orc-companion-last-loaded-model";
 const HIVE_ROUTE_STORAGE_KEY = "orc-companion-hive-route";
 const OWNER_NAME_STORAGE_KEY = "orc-companion-owner-name";
 const AGENT_TOOLS_STORAGE_KEY = "orc-companion-agent-tools";
@@ -289,13 +289,6 @@ function trimTranscript(messages: Message[]) {
 
 function normalizeText(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-}
-
-function deriveContextHealth(messages: Message[]) {
-  const totalChars = messages.reduce((sum, message) => sum + message.text.length, 0);
-  if (totalChars > 10_000 || messages.length > 24) return "Dense";
-  if (totalChars > 4_000 || messages.length > 12) return "Warm";
-  return "Fresh";
 }
 
 function buildDeviceContextMessage(profile: DeviceProfile | null, ownerName: string, batteryCutoff: number): LocalTranscriptMessage | null {
@@ -483,6 +476,7 @@ export default function App() {
   const [toolCapability, setToolCapability] = useState<"unknown" | "checking" | "capable" | "unreliable">("unknown");
   const [lastAgentToolTrace, setLastAgentToolTrace] = useState<ToolActivityEntry[]>([]);
   const agentAbortControllerRef = useRef<AbortController | null>(null);
+  const autoRestoreStartedRef = useRef(false);
   const secureChatHydratedRef = useRef(false);
   const secureUserDataHydratedRef = useRef(false);
   const nativeToolContextRef = useRef({
@@ -536,10 +530,8 @@ export default function App() {
     [models, preferredModelId],
   );
   const loadedModel = useMemo(() => models.find((model) => model.loaded) ?? null, [models]);
-  const activeBackend = useMemo(() => backends.find((backend) => backend.id === loadedModel?.backendId) ?? null, [backends, loadedModel]);
   const connectionLabel = loadedModel ? "Local" : hiveProbe?.status === "optimal" ? "Hive Connected" : "Offline";
   const batteryTooLow = profile?.batteryPercent !== undefined && profile.batteryPercent >= 0 && profile.batteryPercent < batteryCutoff && !profile.charging;
-  const contextHealth = deriveContextHealth(messages);
 
   nativeToolContextRef.current = {
     allowWebSearch: allowMeteredWebSearch && searchMode !== "local",
@@ -661,6 +653,18 @@ export default function App() {
     setActiveTab("settings");
     void runSoakTest(launchArgs.modelId ?? recommendedModel?.id, launchArgs.backendId);
   }, [launchArgs, models, recommendedModel]);
+
+  useEffect(() => {
+    if (autoRestoreStartedRef.current || !runtimeStatus || models.length === 0) return;
+    autoRestoreStartedRef.current = true;
+    if (runtimeStatus.loaded) {
+      if (runtimeStatus.activeModelId) localStorage.setItem(LAST_LOADED_MODEL_KEY, JSON.stringify(runtimeStatus.activeModelId));
+      return;
+    }
+    const lastModelId = readStoredJson<string>(LAST_LOADED_MODEL_KEY, "");
+    const lastModel = models.find((model) => model.id === lastModelId && model.downloaded);
+    if (lastModel) void loadSelectedModel(lastModel).catch((error: any) => setRuntimeError(error?.message || "Unable to restore the last local model."));
+  }, [models, runtimeStatus]);
 
   useEffect(() => {
     if (!runtimeStatus?.loaded) {
@@ -984,6 +988,7 @@ export default function App() {
     setRuntimeError("");
     await LocalLlm.loadModel({ modelId: model.id, backendId: model.backendId });
     await waitForModelLoad(model.id);
+    localStorage.setItem(LAST_LOADED_MODEL_KEY, JSON.stringify(model.id));
   }
 
   function snapshotBranch(label: string, source = messages) {
@@ -1738,33 +1743,21 @@ export default function App() {
         <section className="flex-1 px-4 py-4">
           {activeTab === "chat" && (
             <ChatScreen
-              nativeAvailable={nativeAvailable}
-              setupComplete={setupComplete}
               profile={profile}
-              activeBackend={activeBackend}
-              model={recommendedModel}
               loadedModel={loadedModel}
-              runtimeStatus={runtimeStatus}
-              downloadProgress={downloadProgress}
-              loadState={loadState}
               runtimeError={runtimeError}
               backendBanner={backendBanner}
               messages={messages}
               prompt={prompt}
               isGenerating={isGenerating}
               batteryTooLow={batteryTooLow}
-              contextHealth={contextHealth}
               agentToolsEnabled={agentToolsEnabled}
-              allowMeteredWebSearch={allowMeteredWebSearch}
               searchMode={searchMode}
               attachments={attachments}
               branches={branches}
               temporaryChat={temporaryChat}
               voiceListening={voiceListening}
-              toolCapability={toolCapability}
               onPromptChange={setPrompt}
-              onDownload={downloadSelectedModel}
-              onLoad={loadSelectedModel}
               onSend={sendMessage}
               onStop={stopGeneration}
               onClear={() => { setMessages([]); void LocalLlm.deleteSecureText({ key: "chat-history" }); localStorage.removeItem(CHAT_STORAGE_KEY); }}
@@ -1833,6 +1826,8 @@ export default function App() {
           )}
           {activeTab === "settings" && (
             <SettingsScreen
+              nativeAvailable={nativeAvailable}
+              setupComplete={setupComplete}
               profile={profile}
               backends={backends}
               models={models}
@@ -1873,10 +1868,12 @@ export default function App() {
               onRunSoakTest={() => void runSoakTest()}
               onDeleteModel={async (modelId) => {
                 await LocalLlm.deleteModel({ modelId });
+                if (readStoredJson<string>(LAST_LOADED_MODEL_KEY, "") === modelId) localStorage.removeItem(LAST_LOADED_MODEL_KEY);
                 await refreshLocalState();
               }}
               onUnload={async () => {
                 await LocalLlm.unloadModel();
+                localStorage.removeItem(LAST_LOADED_MODEL_KEY);
                 await refreshLocalState();
               }}
             />
@@ -1909,36 +1906,24 @@ function NavButton({ active, icon, label, onClick }: { active: boolean; icon: Re
 }
 
 function ChatScreen(props: {
-  nativeAvailable: boolean;
-  setupComplete: boolean;
   profile: DeviceProfile | null;
-  activeBackend: BackendRecord | null;
-  model: LocalModelRecord | null;
   loadedModel: LocalModelRecord | null;
-  runtimeStatus: RuntimeStatus | null;
-  downloadProgress: DownloadProgress | null;
-  loadState: ModelLoadState | null;
   runtimeError: string;
   backendBanner: string;
   messages: Message[];
   prompt: string;
   isGenerating: boolean;
   batteryTooLow: boolean;
-  contextHealth: string;
   onPromptChange: (value: string) => void;
-  onDownload: (model?: LocalModelRecord | null) => void;
-  onLoad: (model?: LocalModelRecord | null) => void;
   onSend: () => void;
   onStop: () => void;
   onClear: () => void;
   agentToolsEnabled: boolean;
-  allowMeteredWebSearch: boolean;
   searchMode: SearchMode;
   attachments: ChatAttachment[];
   branches: ChatBranch[];
   temporaryChat: boolean;
   voiceListening: boolean;
-  toolCapability: "unknown" | "checking" | "capable" | "unreliable";
   onSearchMode: (mode: SearchMode) => void;
   onAttachments: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
@@ -1953,7 +1938,6 @@ function ChatScreen(props: {
   onVoiceInput: () => void;
   onSpeak: (text: string) => void;
 }) {
-  const needsSetup = !props.setupComplete || !props.loadedModel;
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
 
@@ -1971,47 +1955,7 @@ function ChatScreen(props: {
   }, [props.prompt]);
 
   return (
-    <div className="flex min-h-[calc(100vh-9rem)] flex-col gap-4">
-      {needsSetup && (
-        <section className="rounded-md border border-lime-400/30 bg-[#071007] p-4">
-          <div className="mb-4 flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-lg font-black">Local chat setup</h2>
-              <p className="mt-1 text-sm text-zinc-400">Install one local model, load it on-device, and keep every chat on this phone.</p>
-            </div>
-            <ShieldCheck className="h-6 w-6 text-lime-300" />
-          </div>
-          <div className="grid gap-2 text-sm">
-            <SetupRow label="Device" value={props.profile ? `${props.profile.manufacturer} ${props.profile.model}` : "Checking"} ok={Boolean(props.profile)} />
-            <SetupRow label="Native backend" value={props.nativeAvailable ? "Android bridge available" : "Open the Android app"} ok={props.nativeAvailable} />
-            <SetupRow label="Storage free" value={props.profile ? formatBytes(props.profile.storageFreeBytes) : "Checking"} ok={(props.profile?.storageFreeBytes ?? 0) > (props.model?.downloadSizeBytes ?? 1)} />
-            <SetupRow label="Recommended model" value={props.model?.downloaded ? "Downloaded" : props.model?.name ?? "Checking"} ok={Boolean(props.model?.downloaded)} />
-          </div>
-          {props.downloadProgress && (
-            <div className="mt-4">
-              <div className="mb-1 flex justify-between text-xs text-zinc-400">
-                <span>Downloading model</span>
-                <span>{Math.round(props.downloadProgress.progress * 100)}%</span>
-              </div>
-              <div className="h-2 overflow-hidden rounded bg-zinc-900">
-                <div className="h-full bg-lime-400" style={{ width: `${Math.min(100, props.downloadProgress.progress * 100)}%` }} />
-              </div>
-            </div>
-          )}
-          <div className="mt-4 flex gap-2">
-            <button onClick={() => props.onDownload(props.model)} disabled={!props.model || props.model.downloaded} className="flex flex-1 items-center justify-center gap-2 rounded-md bg-lime-400 px-3 py-3 text-sm font-black text-black disabled:opacity-40">
-              <Download className="h-4 w-4" />
-              Download
-            </button>
-            <button onClick={() => props.onLoad(props.model)} disabled={!props.model?.downloaded} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-lime-400/40 px-3 py-3 text-sm font-black text-lime-200 disabled:opacity-40">
-              <Play className="h-4 w-4" />
-              Load
-            </button>
-          </div>
-          {props.loadState && <p className="mt-3 text-xs text-zinc-400">Model state: {props.loadState.phase}{props.loadState.backend ? ` (${props.loadState.backend})` : ""}</p>}
-        </section>
-      )}
-
+    <div className="flex min-h-[calc(100vh-9rem)] flex-col gap-2">
       {props.backendBanner && (
         <div className="rounded-md border border-cyan-400/40 bg-cyan-950/20 p-3 text-sm text-cyan-100">{props.backendBanner}</div>
       )}
@@ -2022,62 +1966,49 @@ function ChatScreen(props: {
         <div className="rounded-md border border-amber-500/40 bg-amber-950/20 p-3 text-sm text-amber-100">Battery is below the local inference cutoff.</div>
       )}
 
-      <div className="grid gap-2 md:grid-cols-4">
-        <StatusChip icon={<Cpu className="h-4 w-4" />} label="Backend" value={props.loadedModel?.backend ?? props.activeBackend?.label ?? "Idle"} />
-        <StatusChip icon={<Sparkles className="h-4 w-4" />} label="Model" value={props.loadedModel?.name ?? "None"} />
-        <StatusChip icon={<Network className="h-4 w-4" />} label="Offline" value={props.loadedModel ? "Ready" : "Waiting"} />
-        <StatusChip icon={<ShieldCheck className="h-4 w-4" />} label="Context" value={props.runtimeStatus?.supportsMultiTurn ? `${props.contextHealth} / multi-turn` : `${props.contextHealth} / replayed`} />
-      </div>
-
-      <div className="rounded-md border border-cyan-400/20 bg-cyan-950/10 p-3 text-xs text-cyan-100">
-        <div className="flex items-center justify-between gap-2">
-          <div className="font-bold text-cyan-50">Tool mode</div>
-          <span className={props.toolCapability === "capable" ? "text-lime-300" : props.toolCapability === "unreliable" ? "text-amber-300" : "text-cyan-200/60"}>
-            Native tools: {props.toolCapability}
-          </span>
-        </div>
-        <p className="mt-1 text-cyan-200/80">
-          {props.agentToolsEnabled ? "Agent tools on" : "Agent tools off"} · web search {props.allowMeteredWebSearch ? "allowed" : "blocked"}.
-        </p>
-        <p className="mt-1 text-cyan-200/60">
-          Available tools: web_search, fetch_page, device profile, HIVE status, scrape queue, Android actions.
-        </p>
-        <div className="mt-3 grid grid-cols-3 gap-2">
-          {(["local", "auto", "search"] as SearchMode[]).map((mode) => (
-            <button key={mode} disabled={!props.agentToolsEnabled && mode !== "local"} onClick={() => props.onSearchMode(mode)} className={`rounded-md border px-2 py-2 font-bold capitalize disabled:opacity-30 ${props.searchMode === mode ? "border-cyan-300 bg-cyan-300 text-black" : "border-cyan-900 text-cyan-200"}`}>
-              {mode}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      <section className="flex flex-1 flex-col rounded-md border border-zinc-800 bg-[#050805]">
-        <div className="flex items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2">
-          <div>
-            <span className="text-sm font-bold">{props.loadedModel?.name ?? "No local model loaded"}</span>
-            <p className="text-xs text-zinc-500">
-              {props.profile?.batteryPercent && props.profile.batteryPercent >= 0
-                ? `Battery ${Math.round(props.profile.batteryPercent)}%${props.profile.charging ? " / charging" : ""}`
-                : "Battery unknown"}
-            </p>
-          </div>
-          <div className="flex items-center gap-1">
-            {props.branches.length > 0 && (
-              <select aria-label="Restore chat branch" defaultValue="" onChange={(event) => { if (event.target.value) props.onRestoreBranch(event.target.value); event.target.value = ""; }} className="max-w-28 rounded-md border border-zinc-800 bg-black px-2 py-2 text-xs text-zinc-300">
-                <option value="">Branches ({props.branches.length})</option>
-                {props.branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.label}</option>)}
-              </select>
-            )}
+      <section className="flex min-h-0 flex-1 flex-col">
+        <div className="space-y-2 px-1 pb-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-sm font-bold">New chat</p>
+              <p className="truncate text-xs text-zinc-500">{props.loadedModel?.name ?? "No local model loaded"}</p>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
             <button onClick={() => props.onTemporaryChat(!props.temporaryChat)} title="Temporary chat" className={`rounded-md p-2 ${props.temporaryChat ? "bg-amber-400 text-black" : "text-zinc-400 hover:bg-zinc-900"}`}>
               <ShieldCheck className="h-4 w-4" />
             </button>
             <button onClick={props.onExport} title="Export chat" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><Download className="h-4 w-4" /></button>
             <button onClick={props.onClear} title="Clear chat" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><Trash2 className="h-4 w-4" /></button>
+            </div>
+          </div>
+          <div className={`grid gap-2 ${props.branches.length > 0 ? "grid-cols-2" : "grid-cols-1"}`}>
+            <select aria-label="Chat mode" value={props.searchMode} onChange={(event) => props.onSearchMode(event.target.value as SearchMode)} className="min-w-0 rounded-md border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-300">
+              <option value="local">Local</option>
+              <option value="auto" disabled={!props.agentToolsEnabled}>Auto tools</option>
+              <option value="search" disabled={!props.agentToolsEnabled}>Web search</option>
+            </select>
+            {props.branches.length > 0 && (
+              <select aria-label="Restore chat branch" defaultValue="" onChange={(event) => { if (event.target.value) props.onRestoreBranch(event.target.value); event.target.value = ""; }} className="min-w-0 rounded-md border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-300">
+                <option value="">Branches ({props.branches.length})</option>
+                {props.branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.label}</option>)}
+              </select>
+            )}
           </div>
         </div>
-        <div ref={messageListRef} className="flex min-h-80 flex-1 flex-col gap-4 overflow-y-auto p-3">
+        <div ref={messageListRef} className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1 py-3">
           {props.messages.length === 0 ? (
-            <div className="m-auto max-w-sm text-center text-sm text-zinc-500">Once the local model is loaded, this becomes a private, persistent, offline chat thread.</div>
+            <div className="m-auto w-full max-w-xl px-2 py-8 text-center">
+              <img src={companionIcon} alt="" className="mx-auto h-14 w-14 rounded-2xl border border-lime-400/30" />
+              <h2 className="mt-5 text-2xl font-semibold text-zinc-100">How can I help?</h2>
+              <p className="mt-2 text-sm text-zinc-500">Private, local conversation on this device.</p>
+              <div className="mt-7 grid grid-cols-2 gap-2 text-left">
+                {["Help me think through an idea", "Summarize an attached document", "Explain something complex simply", "Plan my next steps"].map((suggestion) => (
+                  <button key={suggestion} onClick={() => props.onPromptChange(suggestion)} className="rounded-2xl border border-zinc-800 bg-zinc-950/60 px-4 py-3 text-sm text-zinc-300 hover:border-zinc-600 hover:bg-zinc-900">
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            </div>
           ) : props.messages.map((message) => (
             <article key={message.id} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
               <div className={`max-w-[92%] rounded-2xl px-4 py-3 text-[15px] leading-6 shadow-sm ${message.role === "user" ? "bg-lime-400 text-black" : message.status === "error" ? "border border-red-500/40 bg-red-950/40 text-red-100" : "border border-zinc-800 bg-zinc-950 text-zinc-100"}`}>
@@ -2130,7 +2061,7 @@ function ChatScreen(props: {
           ))}
         </div>
         {props.attachments.length > 0 && (
-          <div className="flex flex-wrap gap-2 border-t border-zinc-800 px-3 pt-3">
+          <div className="flex flex-wrap gap-2 px-1 pb-2">
             {props.attachments.map((attachment) => (
               <div key={attachment.id} className="flex max-w-full items-center gap-2 rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-300">
                 {attachment.previewUrl && <img src={attachment.previewUrl} alt="" className="h-8 w-8 rounded object-cover" />}
@@ -2140,8 +2071,8 @@ function ChatScreen(props: {
             ))}
           </div>
         )}
-        <div className="flex gap-2 border-t border-zinc-800 p-3">
-          <label title="Attach photo, text, or PDF" className="flex cursor-pointer items-center rounded-2xl border border-zinc-800 px-3 text-zinc-300 hover:border-lime-400">
+        <div className="flex gap-2 rounded-3xl border border-zinc-700 bg-zinc-950 p-2 shadow-lg shadow-black/30 focus-within:border-zinc-500">
+          <label title="Attach photo, text, or PDF" className="flex cursor-pointer items-center rounded-full px-2 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200">
             <Paperclip className="h-5 w-5" />
             <input type="file" accept="image/*,.txt,.md,.json,.csv,.pdf,text/*,application/pdf" multiple className="hidden" onChange={(event) => { props.onAttachments(event.target.files); event.currentTarget.value = ""; }} />
           </label>
@@ -2158,34 +2089,22 @@ function ChatScreen(props: {
             disabled={props.isGenerating}
             placeholder={props.loadedModel ? (props.agentToolsEnabled ? "Ask anything; the assistant can search the web and call tools." : "Ask the local model...") : "Ask about this device, or load a model for full chat"}
             rows={1}
-            className="min-h-[52px] max-h-40 min-w-0 flex-1 resize-none rounded-2xl border border-zinc-800 bg-black px-4 py-3 text-[15px] outline-none focus:border-lime-400 disabled:opacity-50"
+            className="min-h-[48px] max-h-40 min-w-0 flex-1 resize-none bg-transparent px-2 py-3 text-[15px] outline-none disabled:opacity-50"
           />
           {props.isGenerating ? (
-            <button onClick={props.onStop} className="rounded-2xl bg-red-500 px-4 text-black">
+            <button onClick={props.onStop} className="my-1 rounded-full bg-red-500 px-3 text-black">
               <Square className="h-5 w-5" />
             </button>
           ) : (
             <>
-              <button onClick={props.onVoiceInput} title="Voice input" className={`rounded-2xl border px-3 ${props.voiceListening ? "border-red-400 bg-red-500 text-black" : "border-zinc-800 text-zinc-300"}`}><Mic className="h-5 w-5" /></button>
-              <button onClick={props.onSend} disabled={!props.prompt.trim() || props.batteryTooLow} className="rounded-2xl bg-lime-400 px-4 text-black disabled:opacity-40">
+              <button onClick={props.onVoiceInput} title="Voice input" className={`my-1 rounded-full px-3 ${props.voiceListening ? "bg-red-500 text-black" : "text-zinc-400 hover:bg-zinc-900"}`}><Mic className="h-5 w-5" /></button>
+              <button onClick={() => props.onSend()} disabled={!props.prompt.trim() || props.batteryTooLow} className="my-1 rounded-full bg-zinc-100 px-3 text-black disabled:bg-zinc-800 disabled:text-zinc-500">
                 <Send className="h-5 w-5" />
               </button>
             </>
           )}
         </div>
       </section>
-    </div>
-  );
-}
-
-function StatusChip({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
-  return (
-    <div className="rounded-md border border-zinc-800 bg-[#050805] px-3 py-2">
-      <div className="mb-1 flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-zinc-500">
-        {icon}
-        <span>{label}</span>
-      </div>
-      <div className="text-sm font-bold text-zinc-100">{value}</div>
     </div>
   );
 }
@@ -2487,7 +2406,48 @@ function JobsScreen({ jobs, organizePath, scrapeUrl, error, onOrganizePath, onSc
   );
 }
 
-function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, ownerNameAutoDetected, developerMode, preferredBackendPolicy, preferredModelId, activeRoute, soakTestRunning, soakTestResult, agentToolsEnabled, allowMeteredWebSearch, lastAgentToolTrace, loadedModelId, downloadProgress, loadState, memories, memoryEnabled, temporaryChat, onBatteryCutoff, onOwnerName, onRequestContactsAccess, onDeveloperMode, onPreferredBackendPolicy, onPreferredModelId, onDownload, onLoad, onAgentToolsEnabled, onAllowMeteredWebSearch, onMemoryChange, onMemoryDelete, onClearMemories, onMemoryEnabled, onTemporaryChat, onRefresh, onRunSoakTest, onDeleteModel, onUnload }: {
+function LocalChatSetupCard({ nativeAvailable, profile, model, downloadProgress, loadState, onDownload, onLoad }: {
+  nativeAvailable: boolean;
+  profile: DeviceProfile | null;
+  model?: LocalModelRecord;
+  downloadProgress: DownloadProgress | null;
+  loadState: ModelLoadState | null;
+  onDownload: (model: LocalModelRecord) => void;
+  onLoad: (model: LocalModelRecord) => void;
+}) {
+  return (
+    <section className="rounded-md border border-lime-400/30 bg-[#071007] p-4">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-black">Local chat setup</h2>
+          <p className="mt-1 text-sm text-zinc-400">Install one local model, load it on-device, and keep every chat on this phone.</p>
+        </div>
+        <ShieldCheck className="h-6 w-6 text-lime-300" />
+      </div>
+      <div className="grid gap-2 text-sm">
+        <SetupRow label="Device" value={profile ? `${profile.manufacturer} ${profile.model}` : "Checking"} ok={Boolean(profile)} />
+        <SetupRow label="Native backend" value={nativeAvailable ? "Android bridge available" : "Open the Android app"} ok={nativeAvailable} />
+        <SetupRow label="Storage free" value={profile ? formatBytes(profile.storageFreeBytes) : "Checking"} ok={(profile?.storageFreeBytes ?? 0) > (model?.downloadSizeBytes ?? 1)} />
+        <SetupRow label="Selected model" value={model?.downloaded ? "Downloaded" : model?.name ?? "Checking"} ok={Boolean(model?.downloaded)} />
+      </div>
+      {downloadProgress && (
+        <div className="mt-4">
+          <div className="mb-1 flex justify-between text-xs text-zinc-400"><span>Downloading model</span><span>{Math.round(downloadProgress.progress * 100)}%</span></div>
+          <div className="h-2 overflow-hidden rounded bg-zinc-900"><div className="h-full bg-lime-400" style={{ width: `${Math.min(100, downloadProgress.progress * 100)}%` }} /></div>
+        </div>
+      )}
+      <div className="mt-4 flex gap-2">
+        <button onClick={() => model && onDownload(model)} disabled={!model || model.downloaded} className="flex flex-1 items-center justify-center gap-2 rounded-md bg-lime-400 px-3 py-3 text-sm font-black text-black disabled:opacity-40"><Download className="h-4 w-4" />Download</button>
+        <button onClick={() => model && onLoad(model)} disabled={!model?.downloaded} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-lime-400/40 px-3 py-3 text-sm font-black text-lime-200 disabled:opacity-40"><Play className="h-4 w-4" />Load</button>
+      </div>
+      {loadState && <p className="mt-3 text-xs text-zinc-400">Model state: {loadState.phase}{loadState.backend ? ` (${loadState.backend})` : ""}</p>}
+    </section>
+  );
+}
+
+function SettingsScreen({ nativeAvailable, setupComplete, profile, backends, models, batteryCutoff, ownerName, ownerNameAutoDetected, developerMode, preferredBackendPolicy, preferredModelId, activeRoute, soakTestRunning, soakTestResult, agentToolsEnabled, allowMeteredWebSearch, lastAgentToolTrace, loadedModelId, downloadProgress, loadState, memories, memoryEnabled, temporaryChat, onBatteryCutoff, onOwnerName, onRequestContactsAccess, onDeveloperMode, onPreferredBackendPolicy, onPreferredModelId, onDownload, onLoad, onAgentToolsEnabled, onAllowMeteredWebSearch, onMemoryChange, onMemoryDelete, onClearMemories, onMemoryEnabled, onTemporaryChat, onRefresh, onRunSoakTest, onDeleteModel, onUnload }: {
+  nativeAvailable: boolean;
+  setupComplete: boolean;
   profile: DeviceProfile | null;
   backends: BackendRecord[];
   models: LocalModelRecord[];
@@ -2534,12 +2494,24 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
   const curatedModels = [...models].sort((left, right) => Number(right.rawBase) - Number(left.rawBase)
     || Number(right.recommended) - Number(left.recommended)
     || left.downloadSizeBytes - right.downloadSizeBytes);
+  const selectedModel = curatedModels.find((model) => model.id === preferredModelId) ?? curatedModels[0];
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-black">Settings</h2>
         <button onClick={onRefresh} className="rounded-md border border-zinc-800 p-2 text-zinc-300"><RefreshCw className="h-4 w-4" /></button>
       </div>
+      {(!setupComplete || !loadedModelId) && (
+        <LocalChatSetupCard
+          nativeAvailable={nativeAvailable}
+          profile={profile}
+          model={selectedModel}
+          downloadProgress={downloadProgress}
+          loadState={loadState}
+          onDownload={onDownload}
+          onLoad={onLoad}
+        />
+      )}
       <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
         <div className="flex items-center gap-2 text-sm font-bold"><HardDrive className="h-4 w-4 text-lime-300" /> Device</div>
         <p className="mt-2 text-sm text-zinc-400">{profile ? `${profile.manufacturer} ${profile.model}, Android ${profile.androidVersion}` : "Unknown device"}</p>
@@ -2635,12 +2607,23 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
         <div className="mb-2 text-sm font-bold">Curated Android model downloader</div>
         <p className="mb-3 text-xs text-zinc-500">Only public LiteRT-LM artifacts with verified sizes and SHA-256 hashes are listed. Raw base models sort first when available.</p>
         <p className="mb-3 rounded-md border border-amber-400/20 bg-amber-950/20 p-2 text-xs text-amber-200">The verified Llama 3.2 1B raw artifact requires Hugging Face authentication, so it is intentionally excluded until secure token support is added.</p>
-        {curatedModels.map((model) => {
+        <label className="mb-3 block text-xs font-bold text-zinc-300" htmlFor="model-picker">Model</label>
+        <select
+          id="model-picker"
+          value={selectedModel?.id ?? ""}
+          onChange={(event) => onPreferredModelId(event.target.value)}
+          disabled={curatedModels.length === 0}
+          className="w-full rounded-md border border-zinc-800 bg-black px-3 py-3 text-sm text-zinc-100 outline-none focus:border-lime-400 disabled:opacity-40"
+        >
+          {curatedModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+        </select>
+        {selectedModel && (() => {
+          const model = selectedModel;
           const insufficientRam = Boolean(profile?.totalRamBytes && profile.totalRamBytes < model.minimumRamBytes);
           const insufficientStorage = Boolean(profile?.storageFreeBytes && profile.storageFreeBytes < model.downloadSizeBytes + 67_108_864);
           const activeDownload = downloadProgress?.modelId === model.id;
           return (
-          <div key={model.id} className="border-t border-zinc-800 py-4 first:border-t-0">
+          <div className="mt-3 border-t border-zinc-800 pt-4">
             <div className="flex items-start justify-between gap-3">
               <div className="min-w-0">
                 <div className="flex flex-wrap items-center gap-2">
@@ -2656,9 +2639,7 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
                 {activeDownload && <div className="mt-2 h-1.5 overflow-hidden rounded bg-zinc-900"><div className="h-full bg-lime-400" style={{ width: `${Math.min(100, downloadProgress.progress * 100)}%` }} /></div>}
                 {loadState?.modelId === model.id && <p className="mt-1 text-xs text-zinc-500">State: {loadState.phase}</p>}
               </div>
-              <button onClick={() => onPreferredModelId(model.id)} className={`rounded-md border px-2 py-2 text-xs font-bold ${preferredModelId === model.id ? "border-lime-400 text-lime-300" : "border-zinc-800 text-zinc-400"}`}>
-                {preferredModelId === model.id ? "Preferred" : "Prefer"}
-              </button>
+              <span className="rounded-md border border-lime-400 px-2 py-2 text-xs font-bold text-lime-300">Preferred</span>
             </div>
             <div className="mt-3 grid grid-cols-[1fr_1fr_auto] gap-2">
               <button onClick={() => onDownload(model)} disabled={model.downloaded || Boolean(downloadProgress) || insufficientStorage} className="rounded-md bg-lime-400 px-3 py-2 text-xs font-black text-black disabled:opacity-30">{activeDownload ? `${Math.round(downloadProgress.progress * 100)}%` : model.downloaded ? "Downloaded" : "Download"}</button>
@@ -2666,7 +2647,7 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
               <button onClick={() => onDeleteModel(model.id)} disabled={!model.downloaded || model.loaded} title="Delete model" className="rounded-md border border-zinc-800 p-2 text-zinc-400 disabled:opacity-30"><Trash2 className="h-4 w-4" /></button>
             </div>
           </div>
-        );})}
+        );})()}
         <button onClick={onUnload} className="mt-2 w-full rounded-md border border-zinc-800 px-3 py-2 text-sm font-bold text-zinc-300">Unload model</button>
       </div>
       <button onClick={() => onDeveloperMode(!developerMode)} className={`w-full rounded-md border px-3 py-3 text-sm font-black ${developerMode ? "border-lime-400 bg-lime-400 text-black" : "border-zinc-800 text-zinc-300"}`}>
