@@ -19,6 +19,11 @@ export interface ToolActivityEntry {
   detail?: string;
 }
 
+export interface SourceReference {
+  title: string;
+  url: string;
+}
+
 export interface ToolExecutionContext {
   allowWebSearch: boolean;
   allowPrivateHosts: boolean;
@@ -60,4 +65,5 @@ export interface AgentLoopResult {
   rounds: number;
   usedTools: boolean;
   fallbackNotice?: string;
+  sources: SourceReference[];
 }

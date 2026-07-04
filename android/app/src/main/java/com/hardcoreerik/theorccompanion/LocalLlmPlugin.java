@@ -1,15 +1,25 @@
 package com.hardcoreerik.theorccompanion;
 
 import android.Manifest;
+import android.app.Activity;
 import android.app.ActivityManager;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.Cursor;
+import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.StatFs;
+import android.provider.AlarmClock;
+import android.provider.CalendarContract;
 import android.provider.ContactsContract;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
+import android.util.Base64;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -19,6 +29,7 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 import com.google.ai.edge.litertlm.Backend;
 import com.google.ai.edge.litertlm.Content;
 import com.google.ai.edge.litertlm.Contents;
@@ -28,8 +39,10 @@ import com.google.ai.edge.litertlm.Engine;
 import com.google.ai.edge.litertlm.EngineConfig;
 import com.google.ai.edge.litertlm.Message;
 import com.google.ai.edge.litertlm.MessageCallback;
+import com.google.ai.edge.litertlm.OpenApiTool;
 import com.google.ai.edge.litertlm.Role;
 import com.google.ai.edge.litertlm.SamplerConfig;
+import com.google.ai.edge.litertlm.ToolKt;
 import com.google.ai.edge.litertlm.ToolProvider;
 
 import org.json.JSONObject;
@@ -42,23 +55,38 @@ import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.MessageDigest;
+import java.security.KeyStore;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
 
 @CapacitorPlugin(
     name = "LocalLlm",
     permissions = {
-        @Permission(alias = "contacts", strings = { Manifest.permission.READ_CONTACTS })
+        @Permission(alias = "contacts", strings = { Manifest.permission.READ_CONTACTS }),
+        @Permission(alias = "microphone", strings = { Manifest.permission.RECORD_AUDIO })
     }
 )
 public class LocalLlmPlugin extends Plugin {
@@ -66,6 +94,14 @@ public class LocalLlmPlugin extends Plugin {
     private static final String BACKEND_MLC = "mlc";
     private static final String DEFAULT_MODEL_ID = "qwen2.5-1.5b-instruct-litert";
     private static final String SOAK_RESULT_FILE = "last-soak-test.json";
+    private static final String SECURE_CHAT_KEY_ALIAS = "theorc_companion_chat_key";
+    private static final String SECURE_PREFS = "theorc_companion_secure";
+
+    private static final class PendingToolResult {
+        final CountDownLatch latch = new CountDownLatch(1);
+        volatile boolean ok;
+        volatile String output = "";
+    }
 
     private static final class ModelSpec {
         final String id;
@@ -74,6 +110,10 @@ public class LocalLlmPlugin extends Plugin {
         final String url;
         final String sha256;
         final String backendId;
+        final String alignment;
+        final String description;
+        final long minimumRamBytes;
+        final boolean rawBase;
         final boolean recommended;
         final boolean experimental;
         final boolean supportsMultiTurn;
@@ -89,6 +129,10 @@ public class LocalLlmPlugin extends Plugin {
             String url,
             String sha256,
             String backendId,
+            String alignment,
+            String description,
+            long minimumRamBytes,
+            boolean rawBase,
             boolean recommended,
             boolean experimental,
             boolean supportsMultiTurn,
@@ -103,6 +147,10 @@ public class LocalLlmPlugin extends Plugin {
             this.url = url;
             this.sha256 = sha256;
             this.backendId = backendId;
+            this.alignment = alignment;
+            this.description = description;
+            this.minimumRamBytes = minimumRamBytes;
+            this.rawBase = rawBase;
             this.recommended = recommended;
             this.experimental = experimental;
             this.supportsMultiTurn = supportsMultiTurn;
@@ -123,8 +171,12 @@ public class LocalLlmPlugin extends Plugin {
                 "Qwen2.5 1.5B Instruct Q8",
                 "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
                 "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
-                "",
+                "faa60663b333290c1496c499828b21d3e3254a788cacd8cce917ce0f761a2dc9",
                 BACKEND_LITERT,
+                "Post-trained instruct",
+                "Best chat quality in the small curated set; slower and heavier than the 0.6B option.",
+                4_294_967_296L,
+                false,
                 true,
                 false,
                 true,
@@ -143,6 +195,10 @@ public class LocalLlmPlugin extends Plugin {
                 "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/qwen3_0_6b_mixed_int4.litertlm",
                 "b1baab462f6be49d70eada79d715c2c52cd9ece0cad00bddf6a2c097d23498e9",
                 BACKEND_LITERT,
+                "Post-trained / preference aligned",
+                "Fast practical Android chat model with thinking and multilingual support.",
+                2_147_483_648L,
+                false,
                 false,
                 true,
                 true,
@@ -152,6 +208,72 @@ public class LocalLlmPlugin extends Plugin {
                 497_664_000L
             )
         );
+        MODEL_SPECS.put(
+            "smollm2-135m-instruct-litert",
+            new ModelSpec(
+                "smollm2-135m-instruct-litert",
+                "SmolLM2 135M Instruct",
+                "SmolLM2_135M_Instruct.litertlm",
+                "https://huggingface.co/litert-community/SmolLM2-135M-Instruct/resolve/main/SmolLM2_135M_Instruct.litertlm",
+                "ccdc5c85735743f081b7d44ca309cab569f76c0f2f0e8e163449a63721969c37",
+                BACKEND_LITERT,
+                "SFT + DPO",
+                "Tiny 143 MB starter model. Very fast, but substantially less capable than Qwen.",
+                1_073_741_824L,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                142_819_328L
+            )
+        );
+        MODEL_SPECS.put(
+            "smolvlm2-500m-litert",
+            new ModelSpec(
+                "smolvlm2-500m-litert",
+                "SmolVLM2 500M Vision",
+                "SmolVLM2-500M.litertlm",
+                "https://huggingface.co/litert-community/SmolVLM2-500M/resolve/main/SmolVLM2-500M.litertlm",
+                "0dfb6fb881eb16e5ef2b2be04de5476caf939b7d9ae601fdee308bbc5462fd55",
+                BACKEND_LITERT,
+                "Instruction tuned",
+                "Experimental 361 MB vision-language model. Downloadable now; image understanding requires vision runtime support.",
+                2_147_483_648L,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                361_052_336L
+            )
+        );
+        MODEL_SPECS.put(
+            "qwen3-1.7b-litert",
+            new ModelSpec(
+                "qwen3-1.7b-litert",
+                "Qwen3 1.7B",
+                "Qwen3_1.7B.litertlm",
+                "https://huggingface.co/litert-community/Qwen3-1.7B/resolve/main/Qwen3_1.7B.litertlm",
+                "66064a4e9269cb693e124c4e3040bcb8a446b10bca42663896329495add3861c",
+                BACKEND_LITERT,
+                "Post-trained / preference aligned",
+                "More capable Qwen3 option for high-memory phones; 2.1 GB download.",
+                4_294_967_296L,
+                false,
+                false,
+                false,
+                true,
+                true,
+                false,
+                true,
+                2_056_729_520L
+            )
+        );
     }
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
@@ -159,10 +281,60 @@ public class LocalLlmPlugin extends Plugin {
     private final Map<String, Conversation> activeConversations = new HashMap<>();
     private final Map<String, String> accumulatedConversationText = new HashMap<>();
     private final Map<String, String> lastEmittedText = new HashMap<>();
+    private final Map<String, PendingToolResult> pendingToolResults = new ConcurrentHashMap<>();
     private Engine engine;
     private volatile boolean modelLoaded = false;
     private volatile String loadedModelId = "";
     private volatile String loadedBackend = "";
+    private volatile String activeDownloadModelId = "";
+    private SpeechRecognizer speechRecognizer;
+    private TextToSpeech textToSpeech;
+
+    private final class BridgeOpenApiTool implements OpenApiTool {
+        private final String name;
+        private final String description;
+        private final String properties;
+        private final String required;
+
+        BridgeOpenApiTool(String name, String description, String properties, String required) {
+            this.name = name;
+            this.description = description;
+            this.properties = properties;
+            this.required = required;
+        }
+
+        @Override
+        public String getToolDescriptionJsonString() {
+            return "{\"name\":" + JSONObject.quote(name)
+                + ",\"description\":" + JSONObject.quote(description)
+                + ",\"parameters\":{\"type\":\"object\",\"properties\":{" + properties + "},\"required\":" + required + "}}";
+        }
+
+        @Override
+        public String execute(String paramsJsonString) {
+            String callId = UUID.randomUUID().toString();
+            PendingToolResult pending = new PendingToolResult();
+            pendingToolResults.put(callId, pending);
+            try {
+                JSObject event = new JSObject()
+                    .put("callId", callId)
+                    .put("tool", name)
+                    .put("args", new JSObject(paramsJsonString));
+                notifyListeners("nativeToolCall", event);
+                if (!pending.latch.await(30, TimeUnit.SECONDS)) {
+                    return new JSONObject().put("ok", false).put("error", "Tool timed out.").toString();
+                }
+                return new JSONObject()
+                    .put("ok", pending.ok)
+                    .put(pending.ok ? "output" : "error", pending.output)
+                    .toString();
+            } catch (Exception ex) {
+                return "{\"ok\":false,\"error\":" + JSONObject.quote(safeMessage(ex)) + "}";
+            } finally {
+                pendingToolResults.remove(callId);
+            }
+        }
+    }
 
     private void scheduleConversationClose(Conversation conversation) {
         if (conversation == null) {
@@ -349,6 +521,7 @@ public class LocalLlmPlugin extends Plugin {
         status.put("activeBackendLabel", loadedBackend.isEmpty() ? null : loadedBackend);
         status.put("supportsMultiTurn", active != null && active.supportsMultiTurn);
         status.put("supportsStreaming", active != null && active.supportsStreaming);
+        status.put("supportsNativeTools", true);
         call.resolve(status);
     }
 
@@ -405,6 +578,246 @@ public class LocalLlmPlugin extends Plugin {
     }
 
     @PluginMethod
+    public void checkToolCapability(PluginCall call) {
+        if (!modelLoaded || engine == null) {
+            call.reject("No local model is loaded.");
+            return;
+        }
+        worker.submit(() -> {
+            AtomicBoolean invoked = new AtomicBoolean(false);
+            OpenApiTool probe = new OpenApiTool() {
+                @Override
+                public String getToolDescriptionJsonString() {
+                    return "{\"name\":\"capability_probe\",\"description\":\"Required capability test.\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}";
+                }
+
+                @Override
+                public String execute(String ignored) {
+                    invoked.set(true);
+                    return "{\"ok\":true}";
+                }
+            };
+            try (Conversation conversation = createConversation(null, Collections.singletonList(ToolKt.tool(probe)))) {
+                conversation.sendMessage("Call capability_probe now, then answer only ready.", new HashMap<>());
+                call.resolve(new JSObject().put("capable", invoked.get()).put("detail", invoked.get() ? "Native structured tool call succeeded." : "Model did not produce a structured tool call."));
+            } catch (Throwable throwable) {
+                call.resolve(new JSObject().put("capable", false).put("detail", safeMessage(throwable)));
+            }
+        });
+    }
+
+    @PluginMethod
+    public void resolveToolCall(PluginCall call) {
+        PendingToolResult pending = pendingToolResults.get(call.getString("callId", ""));
+        if (pending == null) {
+            call.resolve(new JSObject().put("resolved", false));
+            return;
+        }
+        pending.ok = Boolean.TRUE.equals(call.getBoolean("ok", false));
+        pending.output = call.getString("output", "");
+        pending.latch.countDown();
+        call.resolve(new JSObject().put("resolved", true));
+    }
+
+    @PluginMethod
+    public void startVoiceInput(PluginCall call) {
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            requestPermissionForAlias("microphone", call, "microphonePermissionCallback");
+            return;
+        }
+        beginVoiceInput(call);
+    }
+
+    @PermissionCallback
+    private void microphonePermissionCallback(PluginCall call) {
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            call.reject("Microphone permission was denied.");
+            return;
+        }
+        beginVoiceInput(call);
+    }
+
+    private void beginVoiceInput(PluginCall call) {
+        Activity activity = attachedActivity(call);
+        if (activity == null) return;
+        activity.runOnUiThread(() -> {
+            if (!SpeechRecognizer.isRecognitionAvailable(getContext())) {
+                call.reject("Speech recognition is unavailable on this device.");
+                return;
+            }
+            if (speechRecognizer != null) speechRecognizer.destroy();
+            speechRecognizer = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(getContext())
+                ? SpeechRecognizer.createOnDeviceSpeechRecognizer(getContext())
+                : SpeechRecognizer.createSpeechRecognizer(getContext());
+            speechRecognizer.setRecognitionListener(new RecognitionListener() {
+                @Override public void onReadyForSpeech(Bundle params) {}
+                @Override public void onBeginningOfSpeech() {}
+                @Override public void onRmsChanged(float rmsdB) {}
+                @Override public void onBufferReceived(byte[] buffer) {}
+                @Override public void onEndOfSpeech() {}
+                @Override public void onEvent(int eventType, Bundle params) {}
+                @Override public void onPartialResults(Bundle results) { emitVoiceResult(results, false); }
+                @Override public void onResults(Bundle results) { emitVoiceResult(results, true); }
+                @Override public void onError(int error) {
+                    notifyListeners("voiceResult", new JSObject().put("final", true).put("error", "Speech recognition failed (" + error + ")."));
+                }
+            });
+            Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
+            speechRecognizer.startListening(intent);
+            call.resolve(new JSObject().put("started", true));
+        });
+    }
+
+    private void emitVoiceResult(Bundle results, boolean complete) {
+        ArrayList<String> candidates = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+        String text = candidates == null || candidates.isEmpty() ? "" : candidates.get(0);
+        notifyListeners("voiceResult", new JSObject().put("text", text).put("final", complete));
+    }
+
+    @PluginMethod
+    public void stopVoiceInput(PluginCall call) {
+        Activity activity = attachedActivity(call);
+        if (activity == null) return;
+        activity.runOnUiThread(() -> {
+            if (speechRecognizer != null) speechRecognizer.stopListening();
+            call.resolve(new JSObject().put("stopped", true));
+        });
+    }
+
+    @PluginMethod
+    public void speak(PluginCall call) {
+        String text = call.getString("text", "").trim();
+        if (text.isEmpty()) {
+            call.reject("Speech text is required.");
+            return;
+        }
+        Activity activity = attachedActivity(call);
+        if (activity == null) return;
+        activity.runOnUiThread(() -> {
+            if (textToSpeech == null) {
+                textToSpeech = new TextToSpeech(getContext(), status -> {
+                    if (status == TextToSpeech.SUCCESS) textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, "companion-chat");
+                });
+            } else {
+                textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, "companion-chat");
+            }
+            call.resolve(new JSObject().put("started", true));
+        });
+    }
+
+    private Activity attachedActivity(PluginCall call) {
+        Activity activity = getActivity();
+        if (activity == null) call.reject("Activity is unavailable.");
+        return activity;
+    }
+
+    @PluginMethod
+    public void stopSpeaking(PluginCall call) {
+        if (textToSpeech != null) textToSpeech.stop();
+        call.resolve(new JSObject().put("stopped", true));
+    }
+
+    @PluginMethod
+    public void saveSecureText(PluginCall call) {
+        try {
+            String key = call.getString("key", "");
+            String value = call.getString("value", "");
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSecureKey());
+            String encoded = Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP) + ":" + Base64.encodeToString(cipher.doFinal(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)), Base64.NO_WRAP);
+            getContext().getSharedPreferences(SECURE_PREFS, Context.MODE_PRIVATE).edit().putString(key, encoded).apply();
+            call.resolve(new JSObject().put("saved", true));
+        } catch (Throwable throwable) {
+            call.reject("Unable to encrypt chat data: " + safeMessage(throwable));
+        }
+    }
+
+    @PluginMethod
+    public void loadSecureText(PluginCall call) {
+        try {
+            String encoded = getContext().getSharedPreferences(SECURE_PREFS, Context.MODE_PRIVATE).getString(call.getString("key", ""), null);
+            if (encoded == null) {
+                call.resolve(new JSObject().put("exists", false));
+                return;
+            }
+            String[] parts = encoded.split(":", 2);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, getOrCreateSecureKey(), new GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)));
+            String value = new String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), java.nio.charset.StandardCharsets.UTF_8);
+            call.resolve(new JSObject().put("exists", true).put("value", value));
+        } catch (Throwable throwable) {
+            call.reject("Unable to decrypt chat data: " + safeMessage(throwable));
+        }
+    }
+
+    @PluginMethod
+    public void deleteSecureText(PluginCall call) {
+        getContext().getSharedPreferences(SECURE_PREFS, Context.MODE_PRIVATE).edit().remove(call.getString("key", "")).apply();
+        call.resolve(new JSObject().put("deleted", true));
+    }
+
+    private SecretKey getOrCreateSecureKey() throws Exception {
+        KeyStore store = KeyStore.getInstance("AndroidKeyStore");
+        store.load(null);
+        if (store.containsAlias(SECURE_CHAT_KEY_ALIAS)) return (SecretKey) store.getKey(SECURE_CHAT_KEY_ALIAS, null);
+        KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
+        generator.init(new KeyGenParameterSpec.Builder(
+            SECURE_CHAT_KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT
+        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build());
+        return generator.generateKey();
+    }
+
+    @PluginMethod
+    public void performDeviceAction(PluginCall call) {
+        if (!Boolean.TRUE.equals(call.getBoolean("confirmed", false))) {
+            call.reject("User confirmation is required.");
+            return;
+        }
+        String action = call.getString("action", "");
+        JSObject payload = call.getObject("payload", new JSObject());
+        Intent intent;
+        switch (action) {
+            case "set_alarm":
+                intent = new Intent(AlarmClock.ACTION_SET_ALARM)
+                    .putExtra(AlarmClock.EXTRA_HOUR, payload.optInt("hour", 9))
+                    .putExtra(AlarmClock.EXTRA_MINUTES, payload.optInt("minute", 0))
+                    .putExtra(AlarmClock.EXTRA_MESSAGE, payload.optString("label", "TheOrc Companion"));
+                break;
+            case "draft_message":
+                intent = new Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + Uri.encode(payload.getString("recipient", ""))))
+                    .putExtra("sms_body", payload.getString("body", ""));
+                break;
+            case "create_calendar":
+                intent = new Intent(Intent.ACTION_INSERT, CalendarContract.Events.CONTENT_URI)
+                    .putExtra(CalendarContract.Events.TITLE, payload.getString("title", "TheOrc Companion event"))
+                    .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, payload.optLong("startTimeMs", System.currentTimeMillis()))
+                    .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, payload.optLong("endTimeMs", System.currentTimeMillis() + 3_600_000));
+                break;
+            case "open_app":
+                intent = getContext().getPackageManager().getLaunchIntentForPackage(payload.getString("packageName", ""));
+                if (intent == null) {
+                    call.reject("That app is not installed or cannot be opened.");
+                    return;
+                }
+                break;
+            default:
+                call.reject("Unsupported device action: " + action);
+                return;
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            getContext().startActivity(intent);
+            call.resolve(new JSObject().put("completed", true).put("detail", "Opened Android confirmation UI for " + action + "."));
+        } catch (Throwable throwable) {
+            call.reject("Android could not open that action: " + safeMessage(throwable));
+        }
+    }
+
+    @PluginMethod
     public void downloadModel(PluginCall call) {
         String modelId = call.getString("modelId", DEFAULT_MODEL_ID);
         ModelSpec spec = MODEL_SPECS.get(modelId);
@@ -416,6 +829,20 @@ public class LocalLlmPlugin extends Plugin {
             call.reject("This model requires a backend that is not available in this build.");
             return;
         }
+        if (!activeDownloadModelId.isEmpty()) {
+            call.reject("Another model download is already running.");
+            return;
+        }
+
+        File partialFile = new File(getModelsDir(), spec.filename + ".part");
+        File finalFile = getModelFile(spec);
+        long remainingBytes = Math.max(0, spec.downloadSizeBytes - (partialFile.exists() ? partialFile.length() : 0));
+        long availableBytes = new StatFs(getModelsDir().getAbsolutePath()).getAvailableBytes();
+        if (!finalFile.exists() && availableBytes < remainingBytes + 67_108_864L) {
+            call.reject("Not enough free storage for this model download.");
+            return;
+        }
+        activeDownloadModelId = modelId;
 
         call.resolve(new JSObject()
             .put("started", true)
@@ -425,8 +852,6 @@ public class LocalLlmPlugin extends Plugin {
         worker.submit(() -> {
             notifyLoadState(spec, "downloading", null, true, null);
             try {
-                File partialFile = new File(getModelsDir(), spec.filename + ".part");
-                File finalFile = getModelFile(spec);
                 if (finalFile.exists()) {
                     verifyChecksum(spec, finalFile);
                     emitDownloadProgress(spec, finalFile.length(), finalFile.length());
@@ -447,11 +872,20 @@ public class LocalLlmPlugin extends Plugin {
                     connection.setRequestProperty("Range", "bytes=" + existingBytes + "-");
                 }
 
+                int responseCode = connection.getResponseCode();
+                if (responseCode != HttpURLConnection.HTTP_OK && responseCode != HttpURLConnection.HTTP_PARTIAL) {
+                    throw new IllegalStateException("Model host returned HTTP " + responseCode + ".");
+                }
+                boolean restartDownload = existingBytes > 0 && responseCode == HttpURLConnection.HTTP_OK;
                 long contentLength = connection.getContentLengthLong();
-                long totalBytes = contentLength > 0 ? contentLength + existingBytes : spec.downloadSizeBytes;
+                long totalBytes = contentLength > 0 ? contentLength + (restartDownload ? 0 : existingBytes) : spec.downloadSizeBytes;
 
                 try (InputStream input = connection.getInputStream();
                      RandomAccessFile output = new RandomAccessFile(partialFile, "rw")) {
+                    if (restartDownload) {
+                        existingBytes = 0;
+                        output.setLength(0);
+                    }
                     output.seek(existingBytes);
                     byte[] buffer = new byte[1024 * 64];
                     long downloaded = existingBytes;
@@ -470,6 +904,8 @@ public class LocalLlmPlugin extends Plugin {
                 finalizeDownloadedModel(spec, partialFile, finalFile);
             } catch (Exception ex) {
                 notifyRuntimeError(null, spec, safeMessage(ex), true, "download_failed");
+            } finally {
+                activeDownloadModelId = "";
             }
         });
     }
@@ -503,7 +939,10 @@ public class LocalLlmPlugin extends Plugin {
                 notifyLoadState(spec, "loading", null, true, null);
                 closeRuntime();
 
-                if (spec.experimental) {
+                if (!spec.supportsGpu) {
+                    engine = createInitializedEngine(modelFile, new Backend.CPU(Math.max(2, Runtime.getRuntime().availableProcessors() / 2)));
+                    loadedBackend = "CPU";
+                } else if (spec.experimental) {
                     try {
                         engine = createInitializedEngine(modelFile, new Backend.CPU(Math.max(2, Runtime.getRuntime().availableProcessors() / 2)));
                         loadedBackend = "CPU";
@@ -601,6 +1040,10 @@ public class LocalLlmPlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         closeRuntime();
+        if (speechRecognizer != null) speechRecognizer.destroy();
+        if (textToSpeech != null) textToSpeech.shutdown();
+        for (PendingToolResult pending : pendingToolResults.values()) pending.latch.countDown();
+        pendingToolResults.clear();
         worker.shutdownNow();
         super.handleOnDestroy();
     }
@@ -634,6 +1077,8 @@ public class LocalLlmPlugin extends Plugin {
         }
 
         JSArray transcript = call.getArray("transcript");
+        JSObject options = call.getObject("options", new JSObject());
+        boolean nativeTools = options.optBoolean("nativeTools", false);
 
         call.resolve(new JSObject()
             .put("started", true)
@@ -650,7 +1095,7 @@ public class LocalLlmPlugin extends Plugin {
                 synchronized (lastEmittedText) {
                     lastEmittedText.put(conversationId, "");
                 }
-                Conversation conversation = createConversation(transcript);
+                Conversation conversation = createConversation(transcript, nativeTools ? buildToolProviders() : new ArrayList<>());
                 synchronized (activeConversations) {
                     activeConversations.put(conversationId, conversation);
                 }
@@ -736,6 +1181,10 @@ public class LocalLlmPlugin extends Plugin {
     }
 
     private Conversation createConversation(JSArray transcript) throws Exception {
+        return createConversation(transcript, new ArrayList<>());
+    }
+
+    private Conversation createConversation(JSArray transcript, List<ToolProvider> tools) throws Exception {
         List<Message> initialMessages = buildInitialMessages(transcript);
         SamplerConfig samplerConfig = new SamplerConfig(40, 0.9, 0.7, 0);
         String systemPrompt = "You are TheOrc Companion running fully on this Android device: "
@@ -749,10 +1198,52 @@ public class LocalLlmPlugin extends Plugin {
         ConversationConfig config = new ConversationConfig(
             Contents.Companion.of(systemPrompt),
             initialMessages,
-            new ArrayList<ToolProvider>(),
-            samplerConfig
+            tools,
+            samplerConfig,
+            true
         );
         return engine.createConversation(config);
+    }
+
+    private List<ToolProvider> buildToolProviders() {
+        List<ToolProvider> tools = new ArrayList<>();
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "web_search",
+            "Search the public web for current information.",
+            "\"query\":{\"type\":\"string\"},\"maxResults\":{\"type\":\"number\"}",
+            "[\"query\"]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "fetch_page",
+            "Read a public web page returned by search.",
+            "\"url\":{\"type\":\"string\"}",
+            "[\"url\"]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "get_device_profile",
+            "Read current phone time, battery, and device information.",
+            "",
+            "[]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "get_hive_status",
+            "Probe the selected HIVE route.",
+            "\"targetHost\":{\"type\":\"string\"}",
+            "[]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "queue_scrape_url",
+            "Queue a URL scraping job on the selected HIVE route.",
+            "\"url\":{\"type\":\"string\"}",
+            "[\"url\"]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "device_action",
+            "Request a user-confirmed Android action: set_alarm, draft_message, create_calendar, or open_app.",
+            "\"action\":{\"type\":\"string\"},\"payload\":{\"type\":\"object\"}",
+            "[\"action\"]"
+        )));
+        return tools;
     }
 
     private List<Message> buildInitialMessages(JSArray transcript) throws Exception {
@@ -1107,6 +1598,10 @@ public class LocalLlmPlugin extends Plugin {
             .put("filename", spec.filename)
             .put("url", spec.url)
             .put("sha256", spec.sha256)
+            .put("alignment", spec.alignment)
+            .put("description", spec.description)
+            .put("minimumRamBytes", spec.minimumRamBytes)
+            .put("rawBase", spec.rawBase)
             .put("recommended", spec.recommended)
             .put("downloaded", modelFile.exists())
             .put("loaded", modelLoaded && spec.id.equals(loadedModelId))

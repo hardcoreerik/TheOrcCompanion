@@ -39,6 +39,10 @@ export interface LocalModelRecord {
   filename: string;
   url: string;
   sha256: string;
+  alignment: string;
+  description: string;
+  minimumRamBytes: number;
+  rawBase: boolean;
   recommended: boolean;
   downloaded: boolean;
   loaded: boolean;
@@ -69,6 +73,19 @@ export interface RuntimeStatus {
   activeBackendLabel?: string;
   supportsMultiTurn: boolean;
   supportsStreaming: boolean;
+  supportsNativeTools?: boolean;
+}
+
+export interface VoiceResult {
+  text?: string;
+  final: boolean;
+  error?: string;
+}
+
+export interface NativeToolCallEvent {
+  callId: string;
+  tool: string;
+  args: Record<string, unknown>;
 }
 
 export interface DownloadProgress {
@@ -178,6 +195,16 @@ export interface LocalLlmPlugin {
   getLaunchArgs(): Promise<LaunchArgs>;
   getLastSoakTestResult(): Promise<{ exists: boolean; rawJson?: string }>;
   saveSoakTestResult(options: { rawJson: string }): Promise<{ saved: boolean; path?: string }>;
+  checkToolCapability(): Promise<{ capable: boolean; detail?: string }>;
+  startVoiceInput(): Promise<{ started: boolean }>;
+  stopVoiceInput(): Promise<{ stopped: boolean }>;
+  speak(options: { text: string }): Promise<{ started: boolean }>;
+  stopSpeaking(): Promise<{ stopped: boolean }>;
+  saveSecureText(options: { key: string; value: string }): Promise<{ saved: boolean }>;
+  loadSecureText(options: { key: string }): Promise<{ exists: boolean; value?: string }>;
+  deleteSecureText(options: { key: string }): Promise<{ deleted: boolean }>;
+  resolveToolCall(options: { callId: string; ok: boolean; output: string }): Promise<{ resolved: boolean }>;
+  performDeviceAction(options: { action: string; payload?: Record<string, unknown>; confirmed: boolean }): Promise<{ completed: boolean; detail: string }>;
   downloadModel(options: { modelId: string }): Promise<{ started: boolean; modelId: string; backendId: BackendId }>;
   loadModel(options: { modelId: string; backendId?: BackendId }): Promise<{ started: boolean; modelId: string; backendId: BackendId }>;
   startGeneration(options: {
@@ -206,6 +233,8 @@ export interface LocalLlmPlugin {
   addListener(eventName: "generationCancelled", listenerFunc: (event: GenerationCancelled) => void): Promise<{ remove: () => Promise<void> }>;
   addListener(eventName: "runtimeError", listenerFunc: (event: RuntimeError) => void): Promise<{ remove: () => Promise<void> }>;
   addListener(eventName: "backendSwitch", listenerFunc: (event: BackendSwitchEvent) => void): Promise<{ remove: () => Promise<void> }>;
+  addListener(eventName: "voiceResult", listenerFunc: (event: VoiceResult) => void): Promise<{ remove: () => Promise<void> }>;
+  addListener(eventName: "nativeToolCall", listenerFunc: (event: NativeToolCallEvent) => void): Promise<{ remove: () => Promise<void> }>;
 }
 
 class LocalLlmWeb extends WebPlugin implements LocalLlmPlugin {
@@ -285,6 +314,51 @@ class LocalLlmWeb extends WebPlugin implements LocalLlmPlugin {
 
   async saveSoakTestResult() {
     return { saved: false };
+  }
+
+  async checkToolCapability() {
+    return { capable: false, detail: "Native tool calling requires Android." };
+  }
+
+  async startVoiceInput(): Promise<{ started: boolean }> {
+    throw new Error("Voice input requires the Android app.");
+  }
+
+  async stopVoiceInput() {
+    return { stopped: true };
+  }
+
+  async speak(options: { text: string }) {
+    window.speechSynthesis.speak(new SpeechSynthesisUtterance(options.text));
+    return { started: true };
+  }
+
+  async stopSpeaking() {
+    window.speechSynthesis.cancel();
+    return { stopped: true };
+  }
+
+  async saveSecureText(options: { key: string; value: string }) {
+    localStorage.setItem(`secure:${options.key}`, options.value);
+    return { saved: true };
+  }
+
+  async loadSecureText(options: { key: string }) {
+    const value = localStorage.getItem(`secure:${options.key}`);
+    return value === null ? { exists: false } : { exists: true, value };
+  }
+
+  async deleteSecureText(options: { key: string }) {
+    localStorage.removeItem(`secure:${options.key}`);
+    return { deleted: true };
+  }
+
+  async resolveToolCall() {
+    return { resolved: false };
+  }
+
+  async performDeviceAction(): Promise<{ completed: boolean; detail: string }> {
+    throw new Error("Device actions require the Android app.");
   }
 
   async downloadModel(): Promise<{ started: boolean; modelId: string; backendId: BackendId }> {
