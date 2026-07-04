@@ -268,7 +268,7 @@ public class LocalLlmPlugin extends Plugin {
                 false,
                 true,
                 true,
-                true,
+                false,
                 true,
                 2_056_729_520L
             )
@@ -926,7 +926,10 @@ public class LocalLlmPlugin extends Plugin {
                 notifyLoadState(spec, "loading", null, true, null);
                 closeRuntime();
 
-                if (spec.experimental) {
+                if (!spec.supportsGpu) {
+                    engine = createInitializedEngine(modelFile, new Backend.CPU(Math.max(2, Runtime.getRuntime().availableProcessors() / 2)));
+                    loadedBackend = "CPU";
+                } else if (spec.experimental) {
                     try {
                         engine = createInitializedEngine(modelFile, new Backend.CPU(Math.max(2, Runtime.getRuntime().availableProcessors() / 2)));
                         loadedBackend = "CPU";
