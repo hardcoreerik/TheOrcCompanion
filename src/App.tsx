@@ -1267,7 +1267,14 @@ export default function App() {
   }
 
   async function runObserverDiagnostics(route = activeRoute) {
-    if (!route || !developerMode) return;
+    if (!developerMode) {
+      setHiveError("Enable Developer mode before running observer diagnostics.");
+      return;
+    }
+    if (!route) {
+      setHiveError("Select a HIVE route before running observer diagnostics.");
+      return;
+    }
     setHiveBusy(true);
     setHiveError("");
     try {
@@ -1449,6 +1456,8 @@ export default function App() {
               isGenerating={isGenerating}
               batteryTooLow={batteryTooLow}
               contextHealth={contextHealth}
+              agentToolsEnabled={agentToolsEnabled}
+              allowMeteredWebSearch={allowMeteredWebSearch}
               onPromptChange={setPrompt}
               onDownload={downloadSelectedModel}
               onLoad={loadSelectedModel}
@@ -1593,6 +1602,8 @@ function ChatScreen(props: {
   onSend: () => void;
   onStop: () => void;
   onClear: () => void;
+  agentToolsEnabled: boolean;
+  allowMeteredWebSearch: boolean;
 }) {
   const needsSetup = !props.setupComplete || !props.loadedModel;
   const messageListRef = useRef<HTMLDivElement | null>(null);
@@ -1670,6 +1681,16 @@ function ChatScreen(props: {
         <StatusChip icon={<ShieldCheck className="h-4 w-4" />} label="Context" value={props.runtimeStatus?.supportsMultiTurn ? `${props.contextHealth} / multi-turn` : `${props.contextHealth} / replayed`} />
       </div>
 
+      <div className="rounded-md border border-cyan-400/20 bg-cyan-950/10 p-3 text-xs text-cyan-100">
+        <div className="font-bold text-cyan-50">Tool mode</div>
+        <p className="mt-1 text-cyan-200/80">
+          {props.agentToolsEnabled ? "Agent tools on" : "Agent tools off"} · web search {props.allowMeteredWebSearch ? "allowed" : "blocked"}.
+        </p>
+        <p className="mt-1 text-cyan-200/60">
+          Available tools: web_search, fetch_page, get_device_profile, get_hive_status, queue_scrape_url.
+        </p>
+      </div>
+
       <section className="flex flex-1 flex-col rounded-md border border-zinc-800 bg-[#050805]">
         <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-2">
           <div>
@@ -1727,7 +1748,7 @@ function ChatScreen(props: {
               }
             }}
             disabled={props.isGenerating}
-            placeholder={props.loadedModel ? "Ask the local model..." : "Ask about this device, or load a model for full chat"}
+            placeholder={props.loadedModel ? (props.agentToolsEnabled ? "Ask anything; the assistant can search the web and call tools." : "Ask the local model...") : "Ask about this device, or load a model for full chat"}
             rows={1}
             className="min-h-[52px] max-h-40 min-w-0 flex-1 resize-none rounded-2xl border border-zinc-800 bg-black px-4 py-3 text-[15px] outline-none focus:border-lime-400 disabled:opacity-50"
           />
@@ -1981,6 +2002,7 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
           ))}
         </div>
       </div>
+      {error && <div className="rounded-md border border-red-500/40 bg-red-950/20 p-3 text-sm text-red-200">{error}</div>}
       {developerMode && (
         <div className="rounded-md border border-cyan-400/20 bg-cyan-950/10 p-3">
           <div className="mb-3 flex items-center justify-between gap-2">
