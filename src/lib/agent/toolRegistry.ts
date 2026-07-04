@@ -2,6 +2,7 @@ import { getDeviceProfileSnapshot } from "../tools/deviceTools";
 import { formatFetchPageForLlm, fetchPage } from "../tools/fetchPage";
 import { probeHiveRoute, queueScrapeUrlJob } from "../tools/hiveTools";
 import { formatWebSearchForLlm, webSearch } from "../tools/webSearch";
+import { LocalLlm } from "../localLlm";
 import type { ToolDefinition, ToolExecutionContext } from "./types";
 
 function readStringArg(args: Record<string, unknown>, key: string, fallback = "") {
@@ -64,6 +65,21 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
     description: "Queue a companion scrape job for a URL.",
     execute: async (args, context) => queueScrapeUrlJob(context.hive, readStringArg(args, "url")),
   },
+  {
+    name: "device_action",
+    description: "Request a user-confirmed Android action.",
+    execute: async (args) => {
+      const action = readStringArg(args, "action");
+      if (!["set_alarm", "draft_message", "create_calendar", "open_app"].includes(action)) {
+        throw new Error("Unsupported device action.");
+      }
+      const payload = args.payload && typeof args.payload === "object" ? args.payload as Record<string, unknown> : {};
+      const approved = window.confirm(`Allow TheOrc Companion to ${action.replaceAll("_", " ")}?\n\n${JSON.stringify(payload, null, 2)}`);
+      if (!approved) return "The user declined the Android action.";
+      const result = await LocalLlm.performDeviceAction({ action, payload, confirmed: true });
+      return result.detail;
+    },
+  },
 ];
 
 const TOOL_MAP = new Map(TOOL_DEFINITIONS.map((tool) => [tool.name, tool]));
@@ -92,6 +108,8 @@ export function toolActivityLabel(name: string, args: Record<string, unknown>) {
       return "Probing HIVE route";
     case "queue_scrape_url":
       return `Queue scrape: ${readStringArg(args, "url", "url")}`;
+    case "device_action":
+      return `Confirm Android action: ${readStringArg(args, "action", "action")}`;
     default:
       return name;
   }

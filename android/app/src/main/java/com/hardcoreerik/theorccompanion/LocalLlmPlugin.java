@@ -6,10 +6,19 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.database.Cursor;
+import android.net.Uri;
 import android.os.BatteryManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.StatFs;
+import android.provider.AlarmClock;
+import android.provider.CalendarContract;
 import android.provider.ContactsContract;
+import android.speech.RecognitionListener;
+import android.speech.RecognizerIntent;
+import android.speech.SpeechRecognizer;
+import android.speech.tts.TextToSpeech;
+import android.util.Base64;
 
 import com.getcapacitor.JSArray;
 import com.getcapacitor.JSObject;
@@ -19,6 +28,7 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
+import com.getcapacitor.annotation.PermissionCallback;
 import com.google.ai.edge.litertlm.Backend;
 import com.google.ai.edge.litertlm.Content;
 import com.google.ai.edge.litertlm.Contents;
@@ -28,8 +38,10 @@ import com.google.ai.edge.litertlm.Engine;
 import com.google.ai.edge.litertlm.EngineConfig;
 import com.google.ai.edge.litertlm.Message;
 import com.google.ai.edge.litertlm.MessageCallback;
+import com.google.ai.edge.litertlm.OpenApiTool;
 import com.google.ai.edge.litertlm.Role;
 import com.google.ai.edge.litertlm.SamplerConfig;
+import com.google.ai.edge.litertlm.ToolKt;
 import com.google.ai.edge.litertlm.ToolProvider;
 
 import org.json.JSONObject;
@@ -42,23 +54,38 @@ import java.io.RandomAccessFile;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.security.MessageDigest;
+import java.security.KeyStore;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TimeZone;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
+import android.security.keystore.KeyGenParameterSpec;
+import android.security.keystore.KeyProperties;
 
 @CapacitorPlugin(
     name = "LocalLlm",
     permissions = {
-        @Permission(alias = "contacts", strings = { Manifest.permission.READ_CONTACTS })
+        @Permission(alias = "contacts", strings = { Manifest.permission.READ_CONTACTS }),
+        @Permission(alias = "microphone", strings = { Manifest.permission.RECORD_AUDIO })
     }
 )
 public class LocalLlmPlugin extends Plugin {
@@ -66,6 +93,14 @@ public class LocalLlmPlugin extends Plugin {
     private static final String BACKEND_MLC = "mlc";
     private static final String DEFAULT_MODEL_ID = "qwen2.5-1.5b-instruct-litert";
     private static final String SOAK_RESULT_FILE = "last-soak-test.json";
+    private static final String SECURE_CHAT_KEY_ALIAS = "theorc_companion_chat_key";
+    private static final String SECURE_PREFS = "theorc_companion_secure";
+
+    private static final class PendingToolResult {
+        final CountDownLatch latch = new CountDownLatch(1);
+        volatile boolean ok;
+        volatile String output = "";
+    }
 
     private static final class ModelSpec {
         final String id;
@@ -159,10 +194,59 @@ public class LocalLlmPlugin extends Plugin {
     private final Map<String, Conversation> activeConversations = new HashMap<>();
     private final Map<String, String> accumulatedConversationText = new HashMap<>();
     private final Map<String, String> lastEmittedText = new HashMap<>();
+    private final Map<String, PendingToolResult> pendingToolResults = new ConcurrentHashMap<>();
     private Engine engine;
     private volatile boolean modelLoaded = false;
     private volatile String loadedModelId = "";
     private volatile String loadedBackend = "";
+    private SpeechRecognizer speechRecognizer;
+    private TextToSpeech textToSpeech;
+
+    private final class BridgeOpenApiTool implements OpenApiTool {
+        private final String name;
+        private final String description;
+        private final String properties;
+        private final String required;
+
+        BridgeOpenApiTool(String name, String description, String properties, String required) {
+            this.name = name;
+            this.description = description;
+            this.properties = properties;
+            this.required = required;
+        }
+
+        @Override
+        public String getToolDescriptionJsonString() {
+            return "{\"name\":" + JSONObject.quote(name)
+                + ",\"description\":" + JSONObject.quote(description)
+                + ",\"parameters\":{\"type\":\"object\",\"properties\":{" + properties + "},\"required\":" + required + "}}";
+        }
+
+        @Override
+        public String execute(String paramsJsonString) {
+            String callId = UUID.randomUUID().toString();
+            PendingToolResult pending = new PendingToolResult();
+            pendingToolResults.put(callId, pending);
+            try {
+                JSObject event = new JSObject()
+                    .put("callId", callId)
+                    .put("tool", name)
+                    .put("args", new JSObject(paramsJsonString));
+                notifyListeners("nativeToolCall", event);
+                if (!pending.latch.await(30, TimeUnit.SECONDS)) {
+                    return new JSONObject().put("ok", false).put("error", "Tool timed out.").toString();
+                }
+                return new JSONObject()
+                    .put("ok", pending.ok)
+                    .put(pending.ok ? "output" : "error", pending.output)
+                    .toString();
+            } catch (Exception ex) {
+                return "{\"ok\":false,\"error\":" + JSONObject.quote(safeMessage(ex)) + "}";
+            } finally {
+                pendingToolResults.remove(callId);
+            }
+        }
+    }
 
     private void scheduleConversationClose(Conversation conversation) {
         if (conversation == null) {
@@ -349,6 +433,7 @@ public class LocalLlmPlugin extends Plugin {
         status.put("activeBackendLabel", loadedBackend.isEmpty() ? null : loadedBackend);
         status.put("supportsMultiTurn", active != null && active.supportsMultiTurn);
         status.put("supportsStreaming", active != null && active.supportsStreaming);
+        status.put("supportsNativeTools", true);
         call.resolve(status);
     }
 
@@ -401,6 +486,234 @@ public class LocalLlmPlugin extends Plugin {
             call.resolve(new JSObject().put("saved", true).put("path", resultFile.getAbsolutePath()));
         } catch (Exception ex) {
             call.reject("Unable to save soak result: " + safeMessage(ex));
+        }
+    }
+
+    @PluginMethod
+    public void checkToolCapability(PluginCall call) {
+        if (!modelLoaded || engine == null) {
+            call.reject("No local model is loaded.");
+            return;
+        }
+        worker.submit(() -> {
+            AtomicBoolean invoked = new AtomicBoolean(false);
+            OpenApiTool probe = new OpenApiTool() {
+                @Override
+                public String getToolDescriptionJsonString() {
+                    return "{\"name\":\"capability_probe\",\"description\":\"Required capability test.\",\"parameters\":{\"type\":\"object\",\"properties\":{},\"required\":[]}}";
+                }
+
+                @Override
+                public String execute(String ignored) {
+                    invoked.set(true);
+                    return "{\"ok\":true}";
+                }
+            };
+            try (Conversation conversation = createConversation(null, Collections.singletonList(ToolKt.tool(probe)))) {
+                conversation.sendMessage("Call capability_probe now, then answer only ready.", new HashMap<>());
+                call.resolve(new JSObject().put("capable", invoked.get()).put("detail", invoked.get() ? "Native structured tool call succeeded." : "Model did not produce a structured tool call."));
+            } catch (Throwable throwable) {
+                call.resolve(new JSObject().put("capable", false).put("detail", safeMessage(throwable)));
+            }
+        });
+    }
+
+    @PluginMethod
+    public void resolveToolCall(PluginCall call) {
+        PendingToolResult pending = pendingToolResults.get(call.getString("callId", ""));
+        if (pending == null) {
+            call.resolve(new JSObject().put("resolved", false));
+            return;
+        }
+        pending.ok = Boolean.TRUE.equals(call.getBoolean("ok", false));
+        pending.output = call.getString("output", "");
+        pending.latch.countDown();
+        call.resolve(new JSObject().put("resolved", true));
+    }
+
+    @PluginMethod
+    public void startVoiceInput(PluginCall call) {
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            requestPermissionForAlias("microphone", call, "microphonePermissionCallback");
+            return;
+        }
+        beginVoiceInput(call);
+    }
+
+    @PermissionCallback
+    private void microphonePermissionCallback(PluginCall call) {
+        if (getPermissionState("microphone") != PermissionState.GRANTED) {
+            call.reject("Microphone permission was denied.");
+            return;
+        }
+        beginVoiceInput(call);
+    }
+
+    private void beginVoiceInput(PluginCall call) {
+        getActivity().runOnUiThread(() -> {
+            if (!SpeechRecognizer.isRecognitionAvailable(getContext())) {
+                call.reject("Speech recognition is unavailable on this device.");
+                return;
+            }
+            if (speechRecognizer != null) speechRecognizer.destroy();
+            speechRecognizer = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && SpeechRecognizer.isOnDeviceRecognitionAvailable(getContext())
+                ? SpeechRecognizer.createOnDeviceSpeechRecognizer(getContext())
+                : SpeechRecognizer.createSpeechRecognizer(getContext());
+            speechRecognizer.setRecognitionListener(new RecognitionListener() {
+                @Override public void onReadyForSpeech(Bundle params) {}
+                @Override public void onBeginningOfSpeech() {}
+                @Override public void onRmsChanged(float rmsdB) {}
+                @Override public void onBufferReceived(byte[] buffer) {}
+                @Override public void onEndOfSpeech() {}
+                @Override public void onEvent(int eventType, Bundle params) {}
+                @Override public void onPartialResults(Bundle results) { emitVoiceResult(results, false); }
+                @Override public void onResults(Bundle results) { emitVoiceResult(results, true); }
+                @Override public void onError(int error) {
+                    notifyListeners("voiceResult", new JSObject().put("final", true).put("error", "Speech recognition failed (" + error + ")."));
+                }
+            });
+            Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                .putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true);
+            speechRecognizer.startListening(intent);
+            call.resolve(new JSObject().put("started", true));
+        });
+    }
+
+    private void emitVoiceResult(Bundle results, boolean complete) {
+        ArrayList<String> candidates = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+        String text = candidates == null || candidates.isEmpty() ? "" : candidates.get(0);
+        notifyListeners("voiceResult", new JSObject().put("text", text).put("final", complete));
+    }
+
+    @PluginMethod
+    public void stopVoiceInput(PluginCall call) {
+        getActivity().runOnUiThread(() -> {
+            if (speechRecognizer != null) speechRecognizer.stopListening();
+            call.resolve(new JSObject().put("stopped", true));
+        });
+    }
+
+    @PluginMethod
+    public void speak(PluginCall call) {
+        String text = call.getString("text", "").trim();
+        if (text.isEmpty()) {
+            call.reject("Speech text is required.");
+            return;
+        }
+        getActivity().runOnUiThread(() -> {
+            if (textToSpeech == null) {
+                textToSpeech = new TextToSpeech(getContext(), status -> {
+                    if (status == TextToSpeech.SUCCESS) textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, "companion-chat");
+                });
+            } else {
+                textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, "companion-chat");
+            }
+            call.resolve(new JSObject().put("started", true));
+        });
+    }
+
+    @PluginMethod
+    public void stopSpeaking(PluginCall call) {
+        if (textToSpeech != null) textToSpeech.stop();
+        call.resolve(new JSObject().put("stopped", true));
+    }
+
+    @PluginMethod
+    public void saveSecureText(PluginCall call) {
+        try {
+            String key = call.getString("key", "");
+            String value = call.getString("value", "");
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSecureKey());
+            String encoded = Base64.encodeToString(cipher.getIV(), Base64.NO_WRAP) + ":" + Base64.encodeToString(cipher.doFinal(value.getBytes(java.nio.charset.StandardCharsets.UTF_8)), Base64.NO_WRAP);
+            getContext().getSharedPreferences(SECURE_PREFS, Context.MODE_PRIVATE).edit().putString(key, encoded).apply();
+            call.resolve(new JSObject().put("saved", true));
+        } catch (Throwable throwable) {
+            call.reject("Unable to encrypt chat data: " + safeMessage(throwable));
+        }
+    }
+
+    @PluginMethod
+    public void loadSecureText(PluginCall call) {
+        try {
+            String encoded = getContext().getSharedPreferences(SECURE_PREFS, Context.MODE_PRIVATE).getString(call.getString("key", ""), null);
+            if (encoded == null) {
+                call.resolve(new JSObject().put("exists", false));
+                return;
+            }
+            String[] parts = encoded.split(":", 2);
+            Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(Cipher.DECRYPT_MODE, getOrCreateSecureKey(), new GCMParameterSpec(128, Base64.decode(parts[0], Base64.NO_WRAP)));
+            String value = new String(cipher.doFinal(Base64.decode(parts[1], Base64.NO_WRAP)), java.nio.charset.StandardCharsets.UTF_8);
+            call.resolve(new JSObject().put("exists", true).put("value", value));
+        } catch (Throwable throwable) {
+            call.reject("Unable to decrypt chat data: " + safeMessage(throwable));
+        }
+    }
+
+    @PluginMethod
+    public void deleteSecureText(PluginCall call) {
+        getContext().getSharedPreferences(SECURE_PREFS, Context.MODE_PRIVATE).edit().remove(call.getString("key", "")).apply();
+        call.resolve(new JSObject().put("deleted", true));
+    }
+
+    private SecretKey getOrCreateSecureKey() throws Exception {
+        KeyStore store = KeyStore.getInstance("AndroidKeyStore");
+        store.load(null);
+        if (store.containsAlias(SECURE_CHAT_KEY_ALIAS)) return (SecretKey) store.getKey(SECURE_CHAT_KEY_ALIAS, null);
+        KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
+        generator.init(new KeyGenParameterSpec.Builder(
+            SECURE_CHAT_KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT
+        ).setBlockModes(KeyProperties.BLOCK_MODE_GCM).setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build());
+        return generator.generateKey();
+    }
+
+    @PluginMethod
+    public void performDeviceAction(PluginCall call) {
+        if (!Boolean.TRUE.equals(call.getBoolean("confirmed", false))) {
+            call.reject("User confirmation is required.");
+            return;
+        }
+        String action = call.getString("action", "");
+        JSObject payload = call.getObject("payload", new JSObject());
+        Intent intent;
+        switch (action) {
+            case "set_alarm":
+                intent = new Intent(AlarmClock.ACTION_SET_ALARM)
+                    .putExtra(AlarmClock.EXTRA_HOUR, payload.optInt("hour", 9))
+                    .putExtra(AlarmClock.EXTRA_MINUTES, payload.optInt("minute", 0))
+                    .putExtra(AlarmClock.EXTRA_MESSAGE, payload.optString("label", "TheOrc Companion"));
+                break;
+            case "draft_message":
+                intent = new Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:" + Uri.encode(payload.getString("recipient", ""))))
+                    .putExtra("sms_body", payload.getString("body", ""));
+                break;
+            case "create_calendar":
+                intent = new Intent(Intent.ACTION_INSERT, CalendarContract.Events.CONTENT_URI)
+                    .putExtra(CalendarContract.Events.TITLE, payload.getString("title", "TheOrc Companion event"))
+                    .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, payload.optLong("startTimeMs", System.currentTimeMillis()))
+                    .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, payload.optLong("endTimeMs", System.currentTimeMillis() + 3_600_000));
+                break;
+            case "open_app":
+                intent = getContext().getPackageManager().getLaunchIntentForPackage(payload.getString("packageName", ""));
+                if (intent == null) {
+                    call.reject("That app is not installed or cannot be opened.");
+                    return;
+                }
+                break;
+            default:
+                call.reject("Unsupported device action: " + action);
+                return;
+        }
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        try {
+            getContext().startActivity(intent);
+            call.resolve(new JSObject().put("completed", true).put("detail", "Opened Android confirmation UI for " + action + "."));
+        } catch (Throwable throwable) {
+            call.reject("Android could not open that action: " + safeMessage(throwable));
         }
     }
 
@@ -601,6 +914,10 @@ public class LocalLlmPlugin extends Plugin {
     @Override
     protected void handleOnDestroy() {
         closeRuntime();
+        if (speechRecognizer != null) speechRecognizer.destroy();
+        if (textToSpeech != null) textToSpeech.shutdown();
+        for (PendingToolResult pending : pendingToolResults.values()) pending.latch.countDown();
+        pendingToolResults.clear();
         worker.shutdownNow();
         super.handleOnDestroy();
     }
@@ -634,6 +951,8 @@ public class LocalLlmPlugin extends Plugin {
         }
 
         JSArray transcript = call.getArray("transcript");
+        JSObject options = call.getObject("options", new JSObject());
+        boolean nativeTools = options.optBoolean("nativeTools", false);
 
         call.resolve(new JSObject()
             .put("started", true)
@@ -650,7 +969,7 @@ public class LocalLlmPlugin extends Plugin {
                 synchronized (lastEmittedText) {
                     lastEmittedText.put(conversationId, "");
                 }
-                Conversation conversation = createConversation(transcript);
+                Conversation conversation = createConversation(transcript, nativeTools ? buildToolProviders() : new ArrayList<>());
                 synchronized (activeConversations) {
                     activeConversations.put(conversationId, conversation);
                 }
@@ -736,6 +1055,10 @@ public class LocalLlmPlugin extends Plugin {
     }
 
     private Conversation createConversation(JSArray transcript) throws Exception {
+        return createConversation(transcript, new ArrayList<>());
+    }
+
+    private Conversation createConversation(JSArray transcript, List<ToolProvider> tools) throws Exception {
         List<Message> initialMessages = buildInitialMessages(transcript);
         SamplerConfig samplerConfig = new SamplerConfig(40, 0.9, 0.7, 0);
         String systemPrompt = "You are TheOrc Companion running fully on this Android device: "
@@ -749,10 +1072,52 @@ public class LocalLlmPlugin extends Plugin {
         ConversationConfig config = new ConversationConfig(
             Contents.Companion.of(systemPrompt),
             initialMessages,
-            new ArrayList<ToolProvider>(),
-            samplerConfig
+            tools,
+            samplerConfig,
+            true
         );
         return engine.createConversation(config);
+    }
+
+    private List<ToolProvider> buildToolProviders() {
+        List<ToolProvider> tools = new ArrayList<>();
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "web_search",
+            "Search the public web for current information.",
+            "\"query\":{\"type\":\"string\"},\"maxResults\":{\"type\":\"number\"}",
+            "[\"query\"]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "fetch_page",
+            "Read a public web page returned by search.",
+            "\"url\":{\"type\":\"string\"}",
+            "[\"url\"]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "get_device_profile",
+            "Read current phone time, battery, and device information.",
+            "",
+            "[]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "get_hive_status",
+            "Probe the selected HIVE route.",
+            "\"targetHost\":{\"type\":\"string\"}",
+            "[]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "queue_scrape_url",
+            "Queue a URL scraping job on the selected HIVE route.",
+            "\"url\":{\"type\":\"string\"}",
+            "[\"url\"]"
+        )));
+        tools.add(ToolKt.tool(new BridgeOpenApiTool(
+            "device_action",
+            "Request a user-confirmed Android action: set_alarm, draft_message, create_calendar, or open_app.",
+            "\"action\":{\"type\":\"string\"},\"payload\":{\"type\":\"object\"}",
+            "[\"action\"]"
+        )));
+        return tools;
     }
 
     private List<Message> buildInitialMessages(JSArray transcript) throws Exception {

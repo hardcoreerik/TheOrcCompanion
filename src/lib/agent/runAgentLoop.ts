@@ -2,9 +2,23 @@ import type { LocalTranscriptMessage } from "../localLlm";
 import { isLikelyFinalAnswer, parseToolCalls, stripToolCalls } from "./parseToolCalls";
 import { buildAgentSystemPrompt, buildToolResultMessage } from "./systemPrompt";
 import { executeTool, toolActivityLabel } from "./toolRegistry";
-import type { AgentLoopOptions, AgentLoopResult, ToolActivityEntry, ToolExecutionContext } from "./types";
+import type { AgentLoopOptions, AgentLoopResult, SourceReference, ToolActivityEntry, ToolExecutionContext } from "./types";
 
 const DEFAULT_MAX_ROUNDS = 5;
+
+function collectSources(output: string, sources: SourceReference[]) {
+  const lines = output.split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = lines[index].trim().match(/^(?:URL:\s*)?(https?:\/\/\S+)$/i)
+      ?? lines[index].trim().match(/^URL:\s*(https?:\/\/\S+)$/i);
+    if (!match) continue;
+    const url = match[1].replace(/[),.;]+$/, "");
+    if (sources.some((source) => source.url === url)) continue;
+    const previous = lines[index - 1]?.trim().replace(/^\d+\.\s*/, "");
+    const nextTitle = lines[index + 1]?.trim().replace(/^Title:\s*/i, "");
+    sources.push({ title: previous || nextTitle || new URL(url).hostname, url });
+  }
+}
 
 function appendTranscript(
   transcript: LocalTranscriptMessage[],
@@ -17,6 +31,7 @@ function appendTranscript(
 export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoopResult> {
   const maxRounds = options.maxRounds ?? DEFAULT_MAX_ROUNDS;
   const toolActivity: ToolActivityEntry[] = [];
+  const sources: SourceReference[] = [];
   let parseFailures = 0;
   let usedTools = false;
   let fallbackNotice: string | undefined;
@@ -83,6 +98,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
 
       try {
         const output = await executeTool(call.tool, call.args, executionContext);
+        collectSources(output, sources);
         const durationMs = Date.now() - startedMs;
         const entry: ToolActivityEntry = { tool: call.tool, label, ok: true, durationMs };
         toolActivity.push(entry);
@@ -136,5 +152,6 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<AgentLoop
     rounds,
     usedTools,
     fallbackNotice,
+    sources,
   };
 }

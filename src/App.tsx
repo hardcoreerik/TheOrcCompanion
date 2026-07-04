@@ -2,11 +2,16 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
   CheckCircle2,
+  Copy,
   Cpu,
   Download,
+  Edit3,
+  GitBranch,
   HardDrive,
   MessageSquare,
+  Mic,
   Network,
+  Paperclip,
   Play,
   RefreshCw,
   Send,
@@ -15,6 +20,8 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Volume2,
+  X,
 } from "lucide-react";
 import {
   BackendId,
@@ -30,22 +37,33 @@ import {
   LocalModelRecord,
   LocalTranscriptMessage,
   ModelLoadState,
+  NativeToolCallEvent,
   RuntimeError,
   RuntimeStatus,
   SoakTestResult,
   TokenEvent,
+  VoiceResult,
 } from "./lib/localLlm";
 import { runAgentLoop } from "./lib/agent/runAgentLoop";
-import type { ToolActivityEntry } from "./lib/agent/types";
+import { executeTool, toolActivityLabel } from "./lib/agent/toolRegistry";
+import type { SourceReference, ToolActivityEntry } from "./lib/agent/types";
 import { HiveWorkerAgentClient } from "./lib/hive/workerAgent";
 import { forgetPairedNode, getControlStatus, getPairedNode, pairWithNode, runRemoteTask } from "./lib/hive/controlClient";
 import companionIcon from "../assets/02_app_icon.png";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 type AppTab = "chat" | "hive" | "jobs" | "settings";
+type SearchMode = "local" | "auto" | "search";
+type ChatAttachment = { id: string; name: string; type: string; size: number; text: string; previewUrl?: string };
+type MemoryRecord = { id: string; text: string; createdAt: string };
+type ChatBranch = { id: string; label: string; createdAt: string; messages: Message[] };
 type Message = LocalTranscriptMessage & {
   id: string;
   toolActivity?: ToolActivityEntry[];
   agentStatus?: string;
+  sources?: SourceReference[];
+  attachments?: Array<Pick<ChatAttachment, "name" | "type" | "size">>;
+  contextText?: string;
 };
 type HiveTrustState = "unpaired_observer" | "pairing_ready" | "paired_member_pending_server_enforcement" | "blocked_untrusted";
 type HiveVisibilityState = "visible" | "approved_locally" | "blocked";
@@ -147,6 +165,11 @@ const HIVE_ROUTE_STORAGE_KEY = "orc-companion-hive-route";
 const OWNER_NAME_STORAGE_KEY = "orc-companion-owner-name";
 const AGENT_TOOLS_STORAGE_KEY = "orc-companion-agent-tools";
 const ALLOW_METERED_WEB_STORAGE_KEY = "orc-companion-allow-metered-web";
+const SEARCH_MODE_STORAGE_KEY = "orc-companion-search-mode";
+const MEMORY_STORAGE_KEY = "orc-companion-memory-v1";
+const MEMORY_ENABLED_STORAGE_KEY = "orc-companion-memory-enabled";
+const BRANCH_STORAGE_KEY = "orc-companion-branches-v1";
+const TEMPORARY_CHAT_STORAGE_KEY = "orc-companion-temporary-chat";
 const WORKER_MODE_STORAGE_KEY = "orc-companion-hive-worker-mode";
 const WORKER_LANES_DEFAULT = ["researcher"];
 const SOAK_SCRIPT_ID = "linked-15-turn-memory";
@@ -193,6 +216,50 @@ function readStoredJson<T>(key: string, fallback: T): T {
   }
 }
 
+async function readChatAttachment(file: File): Promise<ChatAttachment> {
+  const id = `attachment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  if (file.type.startsWith("image/")) {
+    return { id, name: file.name, type: file.type, size: file.size, text: `[Image attached: ${file.name}]`, previewUrl: URL.createObjectURL(file) };
+  }
+  if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+    const pdfjs = await import("pdfjs-dist");
+    pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+    const document = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+    const pages: string[] = [];
+    for (let pageNumber = 1; pageNumber <= Math.min(document.numPages, 25); pageNumber += 1) {
+      const page = await document.getPage(pageNumber);
+      const content = await page.getTextContent();
+      pages.push(`[${file.name}, page ${pageNumber}]\n${content.items.map((item) => "str" in item ? item.str : "").join(" ")}`);
+    }
+    const text = pages.join("\n\n").replace(/\s+\n/g, "\n").trim();
+    return { id, name: file.name, type: file.type || "application/pdf", size: file.size, text: text.slice(0, 12_000) || `[PDF attached: ${file.name}; no extractable text found]` };
+  }
+  return { id, name: file.name, type: file.type || "text/plain", size: file.size, text: (await file.text()).slice(0, 12_000) };
+}
+
+function memoryContext(memories: MemoryRecord[]): LocalTranscriptMessage | null {
+  if (memories.length === 0) return null;
+  return {
+    role: "system",
+    text: `User-approved memories:\n${memories.map((memory) => `- ${memory.text}`).join("\n")}`,
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function attachmentContext(attachments: ChatAttachment[]) {
+  if (attachments.length === 0) return "";
+  return `Use attached material only when relevant. Cite it as [filename] or [filename, page N].\n\n${attachments.map((attachment) => `Attachment: ${attachment.name} (${attachment.type}, ${attachment.size} bytes)\n${attachment.text}`).join("\n\n")}`;
+}
+
+function sourcesFromToolOutput(output: string): SourceReference[] {
+  const lines = output.split("\n");
+  return lines.flatMap((line, index) => {
+    const match = line.trim().match(/^URL:\s*(https?:\/\/\S+)$/i);
+    if (!match) return [];
+    return [{ title: lines[index - 1]?.trim().replace(/^\d+\.\s*/, "") || lines[index + 1]?.trim().replace(/^Title:\s*/i, "") || new URL(match[1]).hostname, url: match[1] }];
+  });
+}
+
 function toTranscript(messages: Message[]) {
   return messages
     .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
@@ -200,7 +267,7 @@ function toTranscript(messages: Message[]) {
     .map<LocalTranscriptMessage>((message) => ({
       id: message.id,
       role: message.role,
-      text: message.text,
+      text: [message.text, message.contextText].filter(Boolean).join("\n\n"),
       timestamp: message.timestamp,
       backendId: message.backendId,
       modelId: message.modelId,
@@ -406,8 +473,24 @@ export default function App() {
   const [soakTestResult, setSoakTestResult] = useState<SoakTestResult | null>(null);
   const [agentToolsEnabled, setAgentToolsEnabled] = useState(() => readStoredJson<boolean>(AGENT_TOOLS_STORAGE_KEY, true));
   const [allowMeteredWebSearch, setAllowMeteredWebSearch] = useState(() => readStoredJson<boolean>(ALLOW_METERED_WEB_STORAGE_KEY, true));
+  const [searchMode, setSearchMode] = useState<SearchMode>(() => readStoredJson<SearchMode>(SEARCH_MODE_STORAGE_KEY, "auto"));
+  const [memories, setMemories] = useState<MemoryRecord[]>(() => readStoredJson<MemoryRecord[]>(MEMORY_STORAGE_KEY, []));
+  const [memoryEnabled, setMemoryEnabled] = useState(() => readStoredJson<boolean>(MEMORY_ENABLED_STORAGE_KEY, true));
+  const [branches, setBranches] = useState<ChatBranch[]>(() => readStoredJson<ChatBranch[]>(BRANCH_STORAGE_KEY, []));
+  const [temporaryChat, setTemporaryChat] = useState(() => readStoredJson<boolean>(TEMPORARY_CHAT_STORAGE_KEY, false));
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [toolCapability, setToolCapability] = useState<"unknown" | "checking" | "capable" | "unreliable">("unknown");
   const [lastAgentToolTrace, setLastAgentToolTrace] = useState<ToolActivityEntry[]>([]);
   const agentAbortControllerRef = useRef<AbortController | null>(null);
+  const secureChatHydratedRef = useRef(false);
+  const secureUserDataHydratedRef = useRef(false);
+  const nativeToolContextRef = useRef({
+    allowWebSearch: true,
+    allowPrivateHosts: false,
+    device: { profile: null as DeviceProfile | null, ownerName: "", batteryCutoff: 20 },
+    hive: { apiBase: API_BASE, activeRoute: null as { host: string; hiveInfoUrl: string; ollamaUrl: string } | null },
+  });
   const [routes, setRoutes] = useState<HiveRoute[]>([]);
   const [activeRoute, setActiveRoute] = useState<HiveRoute | null>(null);
   const [hiveProbe, setHiveProbe] = useState<HiveProbeResult | null>(null);
@@ -458,9 +541,63 @@ export default function App() {
   const batteryTooLow = profile?.batteryPercent !== undefined && profile.batteryPercent >= 0 && profile.batteryPercent < batteryCutoff && !profile.charging;
   const contextHealth = deriveContextHealth(messages);
 
+  nativeToolContextRef.current = {
+    allowWebSearch: allowMeteredWebSearch && searchMode !== "local",
+    allowPrivateHosts: developerMode,
+    device: { profile, ownerName: ownerName.trim() || ownerNameAutoDetected.trim(), batteryCutoff },
+    hive: {
+      apiBase: API_BASE,
+      activeRoute: activeRoute ? { host: activeRoute.host, hiveInfoUrl: activeRoute.hiveInfoUrl, ollamaUrl: activeRoute.ollamaUrl } : null,
+    },
+  };
+
   useEffect(() => {
-    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages.filter((message) => message.status !== "streaming")));
-  }, [messages]);
+    if (!temporaryChat) {
+      const raw = JSON.stringify(messages.filter((message) => message.status !== "streaming"));
+      if (nativeAvailable) {
+        if (!secureChatHydratedRef.current) return;
+        void LocalLlm.saveSecureText({ key: "chat-history", value: raw });
+        localStorage.removeItem(CHAT_STORAGE_KEY);
+      } else {
+        localStorage.setItem(CHAT_STORAGE_KEY, raw);
+      }
+    }
+  }, [messages, temporaryChat, nativeAvailable]);
+
+  useEffect(() => {
+    if (!nativeAvailable || temporaryChat) return;
+    void LocalLlm.loadSecureText({ key: "chat-history" }).then((result) => {
+      if (!result.exists || !result.value) return;
+      const parsed = JSON.parse(result.value);
+      if (Array.isArray(parsed)) setMessages(parsed);
+    }).catch(() => setRuntimeError("Encrypted chat history could not be loaded.")).finally(() => { secureChatHydratedRef.current = true; });
+  }, [nativeAvailable]);
+
+  useEffect(() => {
+    localStorage.setItem(SEARCH_MODE_STORAGE_KEY, JSON.stringify(searchMode));
+    localStorage.setItem(MEMORY_ENABLED_STORAGE_KEY, JSON.stringify(memoryEnabled));
+    localStorage.setItem(TEMPORARY_CHAT_STORAGE_KEY, JSON.stringify(temporaryChat));
+    if (nativeAvailable) {
+      if (!secureUserDataHydratedRef.current) return;
+      void LocalLlm.saveSecureText({ key: "chat-user-data", value: JSON.stringify({ memories, branches, memoryEnabled }) });
+      localStorage.removeItem(MEMORY_STORAGE_KEY);
+      localStorage.removeItem(BRANCH_STORAGE_KEY);
+    } else {
+      localStorage.setItem(MEMORY_STORAGE_KEY, JSON.stringify(memories));
+      localStorage.setItem(BRANCH_STORAGE_KEY, JSON.stringify(branches));
+    }
+  }, [searchMode, memories, branches, memoryEnabled, temporaryChat, nativeAvailable]);
+
+  useEffect(() => {
+    if (!nativeAvailable) return;
+    void LocalLlm.loadSecureText({ key: "chat-user-data" }).then((result) => {
+      if (!result.exists || !result.value) return;
+      const parsed = JSON.parse(result.value);
+      if (Array.isArray(parsed.memories)) setMemories(parsed.memories);
+      if (Array.isArray(parsed.branches)) setBranches(parsed.branches);
+      if (typeof parsed.memoryEnabled === "boolean") setMemoryEnabled(parsed.memoryEnabled);
+    }).catch(() => setRuntimeError("Encrypted memories could not be loaded.")).finally(() => { secureUserDataHydratedRef.current = true; });
+  }, [nativeAvailable]);
 
   useEffect(() => {
     localStorage.setItem(DEV_MODE_STORAGE_KEY, JSON.stringify(developerMode));
@@ -507,6 +644,8 @@ export default function App() {
     void LocalLlm.addListener("generationCancelled", handleGenerationCancelled).then((handle) => handles.push(handle));
     void LocalLlm.addListener("runtimeError", handleRuntimeError).then((handle) => handles.push(handle));
     void LocalLlm.addListener("backendSwitch", handleBackendSwitch).then((handle) => handles.push(handle));
+    void LocalLlm.addListener("voiceResult", handleVoiceResult).then((handle) => handles.push(handle));
+    void LocalLlm.addListener("nativeToolCall", handleNativeToolCall).then((handle) => handles.push(handle));
 
     return () => {
       clearPrimaryGenerationWatchdog();
@@ -522,6 +661,17 @@ export default function App() {
     setActiveTab("settings");
     void runSoakTest(launchArgs.modelId ?? recommendedModel?.id, launchArgs.backendId);
   }, [launchArgs, models, recommendedModel]);
+
+  useEffect(() => {
+    if (!runtimeStatus?.loaded) {
+      setToolCapability("unknown");
+      return;
+    }
+    setToolCapability("checking");
+    void LocalLlm.checkToolCapability()
+      .then((result) => setToolCapability(result.capable ? "capable" : "unreliable"))
+      .catch(() => setToolCapability("unreliable"));
+  }, [runtimeStatus?.loaded, runtimeStatus?.activeModelId]);
 
   async function refreshLocalState() {
     try {
@@ -635,6 +785,39 @@ export default function App() {
     }
     if (event.phase === "loaded" || event.phase === "downloaded" || event.phase === "unloaded") {
       void refreshLocalState();
+    }
+  }
+
+  function handleVoiceResult(event: VoiceResult) {
+    if (event.error) {
+      setRuntimeError(event.error);
+      setVoiceListening(false);
+      return;
+    }
+    if (event.text) setPrompt(event.text);
+    if (event.final) setVoiceListening(false);
+  }
+
+  async function handleNativeToolCall(event: NativeToolCallEvent) {
+    const startedMs = Date.now();
+    const label = toolActivityLabel(event.tool, event.args);
+    try {
+      const output = await executeTool(event.tool, event.args, nativeToolContextRef.current);
+      const entry: ToolActivityEntry = { tool: event.tool, label, ok: true, durationMs: Date.now() - startedMs };
+      const sources = sourcesFromToolOutput(output);
+      setLastAgentToolTrace((current) => [...current, entry]);
+      setMessages((current) => current.map((message) => message.status === "streaming"
+        ? { ...message, agentStatus: label, toolActivity: [...(message.toolActivity ?? []), entry], sources: [...(message.sources ?? []), ...sources.filter((source) => !(message.sources ?? []).some((existing) => existing.url === source.url))] }
+        : message));
+      await LocalLlm.resolveToolCall({ callId: event.callId, ok: true, output });
+    } catch (error: any) {
+      const detail = error?.message || "Tool execution failed.";
+      const entry: ToolActivityEntry = { tool: event.tool, label, ok: false, durationMs: Date.now() - startedMs, detail };
+      setLastAgentToolTrace((current) => [...current, entry]);
+      setMessages((current) => current.map((message) => message.status === "streaming"
+        ? { ...message, toolActivity: [...(message.toolActivity ?? []), entry] }
+        : message));
+      await LocalLlm.resolveToolCall({ callId: event.callId, ok: false, output: detail });
     }
   }
 
@@ -803,8 +986,92 @@ export default function App() {
     await waitForModelLoad(model.id);
   }
 
-  async function sendMessage() {
-    const text = prompt.trim();
+  function snapshotBranch(label: string, source = messages) {
+    const stable = source.filter((message) => message.status !== "streaming");
+    if (stable.length === 0) return;
+    setBranches((current) => [{ id: `branch-${Date.now()}`, label, createdAt: new Date().toISOString(), messages: stable }, ...current].slice(0, 20));
+  }
+
+  function editMessage(messageId: string) {
+    const index = messages.findIndex((message) => message.id === messageId);
+    if (index < 0) return;
+    snapshotBranch("Before edit");
+    setPrompt(messages[index].text);
+    setMessages(messages.slice(0, index));
+  }
+
+  async function regenerateMessage(messageId: string) {
+    const index = messages.findIndex((message) => message.id === messageId);
+    if (index < 0) return;
+    const userIndex = messages.map((message) => message.role).lastIndexOf("user", index);
+    if (userIndex < 0) return;
+    const text = messages[userIndex].text;
+    const prior = messages.slice(0, userIndex);
+    snapshotBranch("Before regenerate");
+    setMessages(prior);
+    await sendMessage(text, prior);
+  }
+
+  function restoreBranch(branchId: string) {
+    const branch = branches.find((candidate) => candidate.id === branchId);
+    if (!branch) return;
+    snapshotBranch("Before branch switch");
+    setMessages(branch.messages);
+  }
+
+  async function addAttachments(fileList: FileList | null) {
+    if (!fileList) return;
+    try {
+      const next = await Promise.all([...fileList].slice(0, 3).map(readChatAttachment));
+      setAttachments((current) => [...current, ...next].slice(0, 3));
+    } catch (error: any) {
+      setRuntimeError(error?.message || "Unable to read that attachment.");
+    }
+  }
+
+  function exportChat() {
+    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), messages, memories }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `theorc-companion-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function changeTemporaryChat(enabled: boolean) {
+    if (enabled) {
+      setTemporaryChat(true);
+      setMessages([]);
+      return;
+    }
+    let restored: Message[] = [];
+    if (nativeAvailable) {
+      const result = await LocalLlm.loadSecureText({ key: "chat-history" });
+      if (result.exists && result.value) {
+        const parsed = JSON.parse(result.value);
+        if (Array.isArray(parsed)) restored = parsed;
+      }
+    } else {
+      restored = readStoredMessages();
+    }
+    setTemporaryChat(false);
+    setMessages(restored);
+  }
+
+  async function startVoiceInput() {
+    try {
+      setRuntimeError("");
+      setVoiceListening(true);
+      await LocalLlm.startVoiceInput();
+    } catch (error: any) {
+      setVoiceListening(false);
+      setRuntimeError(error?.message || "Voice input is unavailable.");
+    }
+  }
+
+  async function sendMessage(overrideText?: string, historyOverride?: Message[]) {
+    const text = (overrideText ?? prompt).trim();
     if (!text || isGenerating) return;
     const directDeviceReply = await maybeResolveDirectDeviceReply(text);
     if (directDeviceReply) {
@@ -835,7 +1102,16 @@ export default function App() {
       setRuntimeError("Load a local model for open-ended chat. Device questions like time, date, battery, and name can work immediately.");
       return;
     }
-    const history = trimTranscript(messages);
+    const baseHistory = trimTranscript(historyOverride ?? messages);
+    const approvedMemory = memoryEnabled ? memoryContext(memories) : null;
+    const history = approvedMemory ? [approvedMemory, ...baseHistory] : baseHistory;
+    const currentAttachments = overrideText ? [] : attachments;
+    const attachmentText = attachmentContext(currentAttachments);
+    const agentInput = [
+      searchMode === "search" ? "Search the web before answering and cite the returned sources." : "",
+      text,
+      attachmentText,
+    ].filter(Boolean).join("\n\n");
     const resolvedOwnerName = ownerName.trim() || ownerNameAutoDetected.trim();
     const deviceContext = buildDeviceContextMessage(profile, resolvedOwnerName, batteryCutoff);
     const userMessage: Message = {
@@ -845,6 +1121,8 @@ export default function App() {
       timestamp: new Date().toISOString(),
       backendId: loadedModel.backendId,
       modelId: loadedModel.id,
+      attachments: currentAttachments.map(({ name, type, size }) => ({ name, type, size })),
+      contextText: attachmentText,
     };
     const assistantMessage: Message = {
       id: `assistant-${Date.now()}`,
@@ -858,18 +1136,37 @@ export default function App() {
     };
 
     setPrompt("");
+    setAttachments([]);
+    currentAttachments.forEach((attachment) => attachment.previewUrl && URL.revokeObjectURL(attachment.previewUrl));
     setRuntimeError("");
     setIsGenerating(true);
     setMessages((current) => [...current, userMessage, assistantMessage]);
 
-    if (agentToolsEnabled) {
+    if (agentToolsEnabled && searchMode !== "local" && toolCapability === "capable") {
+      armPrimaryGenerationWatchdog();
+      try {
+        await LocalLlm.startGeneration({
+          conversationId: PRIMARY_CONVERSATION_ID,
+          message: agentInput,
+          transcript: deviceContext ? [deviceContext, ...history] : history,
+          modelId: loadedModel.id,
+          backendId: chooseBackendId(loadedModel.backendId),
+          options: { temperature: 0.5, topP: 0.9, nativeTools: true },
+        });
+      } catch (error: any) {
+        handleRuntimeError({ conversationId: PRIMARY_CONVERSATION_ID, message: error?.message || "Native tool generation failed." });
+      }
+      return;
+    }
+
+    if (agentToolsEnabled && searchMode !== "local") {
       agentAbortControllerRef.current = new AbortController();
       try {
         const result = await runAgentLoop({
-          userMessage: text,
+          userMessage: agentInput,
           transcript: history,
           deviceContext,
-          allowWebSearch: allowMeteredWebSearch,
+          allowWebSearch: allowMeteredWebSearch && searchMode !== "local",
           allowPrivateHosts: developerMode,
           signal: agentAbortControllerRef.current.signal,
           device: {
@@ -935,6 +1232,7 @@ export default function App() {
                 status: undefined,
                 agentStatus: undefined,
                 toolActivity: result.toolActivity.length ? result.toolActivity : message.toolActivity,
+                sources: result.sources.length ? result.sources : message.sources,
               }
             : message
         )));
@@ -957,7 +1255,7 @@ export default function App() {
     try {
       await LocalLlm.startGeneration({
         conversationId: PRIMARY_CONVERSATION_ID,
-        message: text,
+        message: agentInput,
         transcript: deviceContext ? [deviceContext, ...history] : history,
         modelId: loadedModel.id,
         backendId: chooseBackendId(loadedModel.backendId),
@@ -1458,12 +1756,31 @@ export default function App() {
               contextHealth={contextHealth}
               agentToolsEnabled={agentToolsEnabled}
               allowMeteredWebSearch={allowMeteredWebSearch}
+              searchMode={searchMode}
+              attachments={attachments}
+              branches={branches}
+              temporaryChat={temporaryChat}
+              voiceListening={voiceListening}
+              toolCapability={toolCapability}
               onPromptChange={setPrompt}
               onDownload={downloadSelectedModel}
               onLoad={loadSelectedModel}
               onSend={sendMessage}
               onStop={stopGeneration}
-              onClear={() => setMessages([])}
+              onClear={() => { setMessages([]); void LocalLlm.deleteSecureText({ key: "chat-history" }); localStorage.removeItem(CHAT_STORAGE_KEY); }}
+              onSearchMode={setSearchMode}
+              onAttachments={addAttachments}
+              onRemoveAttachment={(id) => setAttachments((current) => current.filter((attachment) => attachment.id !== id))}
+              onEdit={editMessage}
+              onRegenerate={regenerateMessage}
+              onDelete={(id) => { snapshotBranch("Before delete"); setMessages((current) => current.filter((message) => message.id !== id)); }}
+              onCopy={(text) => void navigator.clipboard.writeText(text)}
+              onRemember={(text) => setMemories((current) => current.some((memory) => memory.text === text) ? current : [...current, { id: `memory-${Date.now()}`, text, createdAt: new Date().toISOString() }])}
+              onRestoreBranch={restoreBranch}
+              onTemporaryChat={(enabled) => void changeTemporaryChat(enabled)}
+              onExport={exportChat}
+              onVoiceInput={voiceListening ? () => void LocalLlm.stopVoiceInput().finally(() => setVoiceListening(false)) : startVoiceInput}
+              onSpeak={(text) => void LocalLlm.speak({ text: cleanupAssistantDisplayText(text) })}
             />
           )}
           {activeTab === "hive" && (
@@ -1534,6 +1851,14 @@ export default function App() {
               onAllowMeteredWebSearch={setAllowMeteredWebSearch}
               lastAgentToolTrace={lastAgentToolTrace}
               loadedModelId={loadedModel?.id ?? ""}
+              memories={memories}
+              memoryEnabled={memoryEnabled}
+              temporaryChat={temporaryChat}
+              onMemoryChange={(id, text) => setMemories((current) => current.map((memory) => memory.id === id ? { ...memory, text } : memory))}
+              onMemoryDelete={(id) => setMemories((current) => current.filter((memory) => memory.id !== id))}
+              onClearMemories={() => setMemories([])}
+              onMemoryEnabled={setMemoryEnabled}
+              onTemporaryChat={(enabled) => void changeTemporaryChat(enabled)}
               onBatteryCutoff={setBatteryCutoff}
               onOwnerName={setOwnerName}
               onRequestContactsAccess={() => void requestContactsAccess()}
@@ -1604,6 +1929,25 @@ function ChatScreen(props: {
   onClear: () => void;
   agentToolsEnabled: boolean;
   allowMeteredWebSearch: boolean;
+  searchMode: SearchMode;
+  attachments: ChatAttachment[];
+  branches: ChatBranch[];
+  temporaryChat: boolean;
+  voiceListening: boolean;
+  toolCapability: "unknown" | "checking" | "capable" | "unreliable";
+  onSearchMode: (mode: SearchMode) => void;
+  onAttachments: (files: FileList | null) => void;
+  onRemoveAttachment: (id: string) => void;
+  onEdit: (id: string) => void;
+  onRegenerate: (id: string) => void;
+  onDelete: (id: string) => void;
+  onCopy: (text: string) => void;
+  onRemember: (text: string) => void;
+  onRestoreBranch: (id: string) => void;
+  onTemporaryChat: (enabled: boolean) => void;
+  onExport: () => void;
+  onVoiceInput: () => void;
+  onSpeak: (text: string) => void;
 }) {
   const needsSetup = !props.setupComplete || !props.loadedModel;
   const messageListRef = useRef<HTMLDivElement | null>(null);
@@ -1682,17 +2026,29 @@ function ChatScreen(props: {
       </div>
 
       <div className="rounded-md border border-cyan-400/20 bg-cyan-950/10 p-3 text-xs text-cyan-100">
-        <div className="font-bold text-cyan-50">Tool mode</div>
+        <div className="flex items-center justify-between gap-2">
+          <div className="font-bold text-cyan-50">Tool mode</div>
+          <span className={props.toolCapability === "capable" ? "text-lime-300" : props.toolCapability === "unreliable" ? "text-amber-300" : "text-cyan-200/60"}>
+            Native tools: {props.toolCapability}
+          </span>
+        </div>
         <p className="mt-1 text-cyan-200/80">
           {props.agentToolsEnabled ? "Agent tools on" : "Agent tools off"} · web search {props.allowMeteredWebSearch ? "allowed" : "blocked"}.
         </p>
         <p className="mt-1 text-cyan-200/60">
-          Available tools: web_search, fetch_page, get_device_profile, get_hive_status, queue_scrape_url.
+          Available tools: web_search, fetch_page, device profile, HIVE status, scrape queue, Android actions.
         </p>
+        <div className="mt-3 grid grid-cols-3 gap-2">
+          {(["local", "auto", "search"] as SearchMode[]).map((mode) => (
+            <button key={mode} disabled={!props.agentToolsEnabled && mode !== "local"} onClick={() => props.onSearchMode(mode)} className={`rounded-md border px-2 py-2 font-bold capitalize disabled:opacity-30 ${props.searchMode === mode ? "border-cyan-300 bg-cyan-300 text-black" : "border-cyan-900 text-cyan-200"}`}>
+              {mode}
+            </button>
+          ))}
+        </div>
       </div>
 
       <section className="flex flex-1 flex-col rounded-md border border-zinc-800 bg-[#050805]">
-        <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-2">
+        <div className="flex items-center justify-between gap-2 border-b border-zinc-800 px-3 py-2">
           <div>
             <span className="text-sm font-bold">{props.loadedModel?.name ?? "No local model loaded"}</span>
             <p className="text-xs text-zinc-500">
@@ -1701,9 +2057,19 @@ function ChatScreen(props: {
                 : "Battery unknown"}
             </p>
           </div>
-          <button onClick={props.onClear} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900">
-            <Trash2 className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-1">
+            {props.branches.length > 0 && (
+              <select aria-label="Restore chat branch" defaultValue="" onChange={(event) => { if (event.target.value) props.onRestoreBranch(event.target.value); event.target.value = ""; }} className="max-w-28 rounded-md border border-zinc-800 bg-black px-2 py-2 text-xs text-zinc-300">
+                <option value="">Branches ({props.branches.length})</option>
+                {props.branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.label}</option>)}
+              </select>
+            )}
+            <button onClick={() => props.onTemporaryChat(!props.temporaryChat)} title="Temporary chat" className={`rounded-md p-2 ${props.temporaryChat ? "bg-amber-400 text-black" : "text-zinc-400 hover:bg-zinc-900"}`}>
+              <ShieldCheck className="h-4 w-4" />
+            </button>
+            <button onClick={props.onExport} title="Export chat" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><Download className="h-4 w-4" /></button>
+            <button onClick={props.onClear} title="Clear chat" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><Trash2 className="h-4 w-4" /></button>
+          </div>
         </div>
         <div ref={messageListRef} className="flex min-h-80 flex-1 flex-col gap-4 overflow-y-auto p-3">
           {props.messages.length === 0 ? (
@@ -1720,6 +2086,29 @@ function ChatScreen(props: {
                     <span className="ml-1 inline-block h-4 w-2 animate-pulse rounded-sm bg-lime-300/80 align-middle" />
                   )}
                 </div>
+                {message.attachments && message.attachments.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-1 text-xs opacity-70">
+                    {message.attachments.map((attachment) => <span key={attachment.name} className="rounded border border-current/20 px-2 py-1">{attachment.name}</span>)}
+                  </div>
+                )}
+                {!message.status && (
+                  <div className={`mt-3 flex flex-wrap gap-1 border-t pt-2 ${message.role === "user" ? "border-black/20" : "border-zinc-800"}`}>
+                    <button title="Copy" onClick={() => props.onCopy(message.text)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Copy className="h-3.5 w-3.5" /></button>
+                    {message.role === "user" && <button title="Edit and branch" onClick={() => props.onEdit(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Edit3 className="h-3.5 w-3.5" /></button>}
+                    {message.role === "user" && <button title="Remember this" onClick={() => props.onRemember(message.text)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Sparkles className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Regenerate on a new branch" onClick={() => props.onRegenerate(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><GitBranch className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Read aloud" onClick={() => props.onSpeak(message.text)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Volume2 className="h-3.5 w-3.5" /></button>}
+                    <button title="Delete message" onClick={() => props.onDelete(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Trash2 className="h-3.5 w-3.5" /></button>
+                  </div>
+                )}
+                {message.sources && message.sources.length > 0 && (
+                  <div className="mt-3 space-y-1 border-t border-zinc-800 pt-2 text-xs">
+                    <p className="font-bold text-zinc-400">Sources</p>
+                    {message.sources.map((source) => (
+                      <a key={source.url} href={source.url} target="_blank" rel="noreferrer" className="block truncate text-cyan-300 underline">{source.title}</a>
+                    ))}
+                  </div>
+                )}
                 {message.toolActivity && message.toolActivity.length > 0 && (
                   <details className="mt-3 rounded-md border border-zinc-800 bg-black/40 p-2 text-xs text-zinc-400">
                     <summary className="cursor-pointer font-bold text-zinc-300">Tool activity ({message.toolActivity.length})</summary>
@@ -1736,7 +2125,22 @@ function ChatScreen(props: {
             </article>
           ))}
         </div>
+        {props.attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 border-t border-zinc-800 px-3 pt-3">
+            {props.attachments.map((attachment) => (
+              <div key={attachment.id} className="flex max-w-full items-center gap-2 rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-300">
+                {attachment.previewUrl && <img src={attachment.previewUrl} alt="" className="h-8 w-8 rounded object-cover" />}
+                <span className="truncate">{attachment.name}</span>
+                <button onClick={() => props.onRemoveAttachment(attachment.id)}><X className="h-3.5 w-3.5" /></button>
+              </div>
+            ))}
+          </div>
+        )}
         <div className="flex gap-2 border-t border-zinc-800 p-3">
+          <label title="Attach photo, text, or PDF" className="flex cursor-pointer items-center rounded-2xl border border-zinc-800 px-3 text-zinc-300 hover:border-lime-400">
+            <Paperclip className="h-5 w-5" />
+            <input type="file" accept="image/*,.txt,.md,.json,.csv,.pdf,text/*,application/pdf" multiple className="hidden" onChange={(event) => { props.onAttachments(event.target.files); event.currentTarget.value = ""; }} />
+          </label>
           <textarea
             ref={composerRef}
             value={props.prompt}
@@ -1757,9 +2161,12 @@ function ChatScreen(props: {
               <Square className="h-5 w-5" />
             </button>
           ) : (
-            <button onClick={props.onSend} disabled={!props.prompt.trim() || props.batteryTooLow} className="rounded-2xl bg-lime-400 px-4 text-black disabled:opacity-40">
-              <Send className="h-5 w-5" />
-            </button>
+            <>
+              <button onClick={props.onVoiceInput} title="Voice input" className={`rounded-2xl border px-3 ${props.voiceListening ? "border-red-400 bg-red-500 text-black" : "border-zinc-800 text-zinc-300"}`}><Mic className="h-5 w-5" /></button>
+              <button onClick={props.onSend} disabled={!props.prompt.trim() || props.batteryTooLow} className="rounded-2xl bg-lime-400 px-4 text-black disabled:opacity-40">
+                <Send className="h-5 w-5" />
+              </button>
+            </>
           )}
         </div>
       </section>
@@ -2076,7 +2483,7 @@ function JobsScreen({ jobs, organizePath, scrapeUrl, error, onOrganizePath, onSc
   );
 }
 
-function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, ownerNameAutoDetected, developerMode, preferredBackendPolicy, preferredModelId, activeRoute, soakTestRunning, soakTestResult, agentToolsEnabled, allowMeteredWebSearch, lastAgentToolTrace, loadedModelId, onBatteryCutoff, onOwnerName, onRequestContactsAccess, onDeveloperMode, onPreferredBackendPolicy, onPreferredModelId, onAgentToolsEnabled, onAllowMeteredWebSearch, onRefresh, onRunSoakTest, onDeleteModel, onUnload }: {
+function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, ownerNameAutoDetected, developerMode, preferredBackendPolicy, preferredModelId, activeRoute, soakTestRunning, soakTestResult, agentToolsEnabled, allowMeteredWebSearch, lastAgentToolTrace, loadedModelId, memories, memoryEnabled, temporaryChat, onBatteryCutoff, onOwnerName, onRequestContactsAccess, onDeveloperMode, onPreferredBackendPolicy, onPreferredModelId, onAgentToolsEnabled, onAllowMeteredWebSearch, onMemoryChange, onMemoryDelete, onClearMemories, onMemoryEnabled, onTemporaryChat, onRefresh, onRunSoakTest, onDeleteModel, onUnload }: {
   profile: DeviceProfile | null;
   backends: BackendRecord[];
   models: LocalModelRecord[];
@@ -2093,6 +2500,9 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
   allowMeteredWebSearch: boolean;
   lastAgentToolTrace: ToolActivityEntry[];
   loadedModelId: string;
+  memories: MemoryRecord[];
+  memoryEnabled: boolean;
+  temporaryChat: boolean;
   onBatteryCutoff: (value: number) => void;
   onOwnerName: (value: string) => void;
   onRequestContactsAccess: () => void;
@@ -2101,6 +2511,11 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
   onPreferredModelId: (value: string) => void;
   onAgentToolsEnabled: (value: boolean) => void;
   onAllowMeteredWebSearch: (value: boolean) => void;
+  onMemoryChange: (id: string, text: string) => void;
+  onMemoryDelete: (id: string) => void;
+  onClearMemories: () => void;
+  onMemoryEnabled: (enabled: boolean) => void;
+  onTemporaryChat: (enabled: boolean) => void;
   onRefresh: () => void;
   onRunSoakTest: () => void;
   onDeleteModel: (modelId: string) => void;
@@ -2149,6 +2564,29 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
         {agentToolsEnabled && smallModelLoaded && (
           <p className="mt-3 text-xs text-amber-300">Qwen3 0.6B may struggle with tool JSON. Prefer Qwen2.5 1.5B for agent mode.</p>
         )}
+      </div>
+      <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="text-sm font-bold">Approved memories</div>
+          <div className="flex items-center gap-3">
+            <button onClick={() => onMemoryEnabled(!memoryEnabled)} className={memoryEnabled ? "text-xs text-lime-300" : "text-xs text-zinc-500"}>{memoryEnabled ? "Enabled" : "Disabled"}</button>
+            <button onClick={onClearMemories} disabled={memories.length === 0} className="text-xs text-red-300 disabled:opacity-30">Forget all</button>
+          </div>
+        </div>
+        <p className="mb-3 text-xs text-zinc-500">Only items you explicitly save are added to future chat context.</p>
+        {memories.length === 0 ? <p className="text-sm text-zinc-500">No saved memories.</p> : memories.map((memory) => (
+          <div key={memory.id} className="mb-2 flex gap-2 last:mb-0">
+            <input value={memory.text} onChange={(event) => onMemoryChange(memory.id, event.target.value)} className="min-w-0 flex-1 rounded-md border border-zinc-800 bg-black px-3 py-2 text-sm" />
+            <button onClick={() => onMemoryDelete(memory.id)} className="rounded-md border border-zinc-800 p-2 text-red-300"><Trash2 className="h-4 w-4" /></button>
+          </div>
+        ))}
+      </div>
+      <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
+        <div className="mb-2 text-sm font-bold">Chat privacy</div>
+        <p className="mb-3 text-xs text-zinc-500">Normal history is encrypted by Android storage. Temporary chat is never persisted.</p>
+        <button onClick={() => onTemporaryChat(!temporaryChat)} className={`w-full rounded-md border px-3 py-3 text-sm font-black ${temporaryChat ? "border-amber-400 bg-amber-400 text-black" : "border-zinc-800 text-zinc-300"}`}>
+          Temporary chat {temporaryChat ? "on" : "off"}
+        </button>
       </div>
       <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
         <div className="mb-2 text-sm font-bold">Backend policy</div>
