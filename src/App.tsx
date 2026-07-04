@@ -468,7 +468,7 @@ export default function App() {
   const [ownerNameAutoDetected, setOwnerNameAutoDetected] = useState("");
   const [developerMode, setDeveloperMode] = useState(() => readStoredJson<boolean>(DEV_MODE_STORAGE_KEY, false));
   const [preferredBackendPolicy, setPreferredBackendPolicy] = useState<BackendPolicy>(() => readStoredJson<BackendPolicy>(BACKEND_POLICY_KEY, "auto"));
-  const [preferredModelId, setPreferredModelId] = useState(() => readStoredJson<string>(PREFERRED_MODEL_KEY, "qwen2.5-0.5b-instruct"));
+  const [preferredModelId, setPreferredModelId] = useState(() => readStoredJson<string>(PREFERRED_MODEL_KEY, "qwen2.5-1.5b-instruct-litert"));
   const [soakTestRunning, setSoakTestRunning] = useState(false);
   const [soakTestResult, setSoakTestResult] = useState<SoakTestResult | null>(null);
   const [agentToolsEnabled, setAgentToolsEnabled] = useState(() => readStoredJson<boolean>(AGENT_TOOLS_STORAGE_KEY, true));
@@ -1851,6 +1851,8 @@ export default function App() {
               onAllowMeteredWebSearch={setAllowMeteredWebSearch}
               lastAgentToolTrace={lastAgentToolTrace}
               loadedModelId={loadedModel?.id ?? ""}
+              downloadProgress={downloadProgress}
+              loadState={loadState}
               memories={memories}
               memoryEnabled={memoryEnabled}
               temporaryChat={temporaryChat}
@@ -1865,6 +1867,8 @@ export default function App() {
               onDeveloperMode={setDeveloperMode}
               onPreferredBackendPolicy={setPreferredBackendPolicy}
               onPreferredModelId={setPreferredModelId}
+              onDownload={(model) => void downloadSelectedModel(model)}
+              onLoad={(model) => void loadSelectedModel(model)}
               onRefresh={refreshLocalState}
               onRunSoakTest={() => void runSoakTest()}
               onDeleteModel={async (modelId) => {
@@ -2483,7 +2487,7 @@ function JobsScreen({ jobs, organizePath, scrapeUrl, error, onOrganizePath, onSc
   );
 }
 
-function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, ownerNameAutoDetected, developerMode, preferredBackendPolicy, preferredModelId, activeRoute, soakTestRunning, soakTestResult, agentToolsEnabled, allowMeteredWebSearch, lastAgentToolTrace, loadedModelId, memories, memoryEnabled, temporaryChat, onBatteryCutoff, onOwnerName, onRequestContactsAccess, onDeveloperMode, onPreferredBackendPolicy, onPreferredModelId, onAgentToolsEnabled, onAllowMeteredWebSearch, onMemoryChange, onMemoryDelete, onClearMemories, onMemoryEnabled, onTemporaryChat, onRefresh, onRunSoakTest, onDeleteModel, onUnload }: {
+function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, ownerNameAutoDetected, developerMode, preferredBackendPolicy, preferredModelId, activeRoute, soakTestRunning, soakTestResult, agentToolsEnabled, allowMeteredWebSearch, lastAgentToolTrace, loadedModelId, downloadProgress, loadState, memories, memoryEnabled, temporaryChat, onBatteryCutoff, onOwnerName, onRequestContactsAccess, onDeveloperMode, onPreferredBackendPolicy, onPreferredModelId, onDownload, onLoad, onAgentToolsEnabled, onAllowMeteredWebSearch, onMemoryChange, onMemoryDelete, onClearMemories, onMemoryEnabled, onTemporaryChat, onRefresh, onRunSoakTest, onDeleteModel, onUnload }: {
   profile: DeviceProfile | null;
   backends: BackendRecord[];
   models: LocalModelRecord[];
@@ -2500,6 +2504,8 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
   allowMeteredWebSearch: boolean;
   lastAgentToolTrace: ToolActivityEntry[];
   loadedModelId: string;
+  downloadProgress: DownloadProgress | null;
+  loadState: ModelLoadState | null;
   memories: MemoryRecord[];
   memoryEnabled: boolean;
   temporaryChat: boolean;
@@ -2509,6 +2515,8 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
   onDeveloperMode: (value: boolean) => void;
   onPreferredBackendPolicy: (value: BackendPolicy) => void;
   onPreferredModelId: (value: string) => void;
+  onDownload: (model: LocalModelRecord) => void;
+  onLoad: (model: LocalModelRecord) => void;
   onAgentToolsEnabled: (value: boolean) => void;
   onAllowMeteredWebSearch: (value: boolean) => void;
   onMemoryChange: (id: string, text: string) => void;
@@ -2523,6 +2531,9 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
 }) {
   const storageUsed = models.reduce((sum, model) => sum + (model.downloaded ? model.bytes : 0), 0);
   const smallModelLoaded = loadedModelId.includes("0.6") || loadedModelId.includes("0_6");
+  const curatedModels = [...models].sort((left, right) => Number(right.rawBase) - Number(left.rawBase)
+    || Number(right.recommended) - Number(left.recommended)
+    || left.downloadSizeBytes - right.downloadSizeBytes);
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -2621,25 +2632,41 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
         <input type="range" min="5" max="80" step="5" value={batteryCutoff} onChange={(event) => onBatteryCutoff(Number(event.target.value))} className="mt-3 w-full accent-lime-400" />
       </div>
       <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
-        <div className="mb-2 text-sm font-bold">Models</div>
-        {models.map((model) => (
-          <div key={model.id} className="border-t border-zinc-800 py-3 first:border-t-0">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <p className="font-bold">{model.name}</p>
-                <p className="text-xs text-zinc-500">{model.backendId} / {model.downloaded ? formatBytes(model.bytes) : "Not downloaded"} {model.loaded ? "/ loaded" : ""}</p>
+        <div className="mb-2 text-sm font-bold">Curated Android model downloader</div>
+        <p className="mb-3 text-xs text-zinc-500">Only public LiteRT-LM artifacts with verified sizes and SHA-256 hashes are listed. Raw base models sort first when available.</p>
+        <p className="mb-3 rounded-md border border-amber-400/20 bg-amber-950/20 p-2 text-xs text-amber-200">The verified Llama 3.2 1B raw artifact requires Hugging Face authentication, so it is intentionally excluded until secure token support is added.</p>
+        {curatedModels.map((model) => {
+          const insufficientRam = Boolean(profile?.totalRamBytes && profile.totalRamBytes < model.minimumRamBytes);
+          const insufficientStorage = Boolean(profile?.storageFreeBytes && profile.storageFreeBytes < model.downloadSizeBytes + 67_108_864);
+          const activeDownload = downloadProgress?.modelId === model.id;
+          return (
+          <div key={model.id} className="border-t border-zinc-800 py-4 first:border-t-0">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="font-bold">{model.name}</p>
+                  {model.rawBase && <span className="rounded bg-fuchsia-400 px-2 py-0.5 text-[10px] font-black text-black">RAW BASE</span>}
+                  {model.recommended && <span className="rounded bg-lime-400 px-2 py-0.5 text-[10px] font-black text-black">RECOMMENDED</span>}
+                </div>
+                <p className="mt-1 text-xs text-cyan-300">{model.alignment}</p>
+                <p className="mt-1 text-xs text-zinc-400">{model.description}</p>
+                <p className="mt-2 text-xs text-zinc-500">Download {formatBytes(model.downloadSizeBytes)} · Suggested RAM {formatBytes(model.minimumRamBytes)} · SHA-256 verified</p>
+                {insufficientRam && <p className="mt-1 text-xs text-amber-300">This phone has less RAM than the suggested minimum.</p>}
+                {insufficientStorage && !model.downloaded && <p className="mt-1 text-xs text-red-300">Not enough free storage for this download.</p>}
+                {activeDownload && <div className="mt-2 h-1.5 overflow-hidden rounded bg-zinc-900"><div className="h-full bg-lime-400" style={{ width: `${Math.min(100, downloadProgress.progress * 100)}%` }} /></div>}
+                {loadState?.modelId === model.id && <p className="mt-1 text-xs text-zinc-500">State: {loadState.phase}</p>}
               </div>
-              <div className="flex items-center gap-2">
-                <button onClick={() => onPreferredModelId(model.id)} className={`rounded-md border px-3 py-2 text-xs font-bold ${preferredModelId === model.id ? "border-lime-400 text-lime-300" : "border-zinc-800 text-zinc-400"}`}>
-                  Preferred
-                </button>
-                <button onClick={() => onDeleteModel(model.id)} disabled={!model.downloaded} className="rounded-md border border-zinc-800 p-2 text-zinc-400 disabled:opacity-30">
-                  <Trash2 className="h-4 w-4" />
-                </button>
-              </div>
+              <button onClick={() => onPreferredModelId(model.id)} className={`rounded-md border px-2 py-2 text-xs font-bold ${preferredModelId === model.id ? "border-lime-400 text-lime-300" : "border-zinc-800 text-zinc-400"}`}>
+                {preferredModelId === model.id ? "Preferred" : "Prefer"}
+              </button>
+            </div>
+            <div className="mt-3 grid grid-cols-[1fr_1fr_auto] gap-2">
+              <button onClick={() => onDownload(model)} disabled={model.downloaded || Boolean(downloadProgress) || insufficientStorage} className="rounded-md bg-lime-400 px-3 py-2 text-xs font-black text-black disabled:opacity-30">{activeDownload ? `${Math.round(downloadProgress.progress * 100)}%` : model.downloaded ? "Downloaded" : "Download"}</button>
+              <button onClick={() => onLoad(model)} disabled={!model.downloaded || model.loaded} className="rounded-md border border-lime-400/40 px-3 py-2 text-xs font-bold text-lime-200 disabled:opacity-30">{model.loaded ? "Loaded" : "Load"}</button>
+              <button onClick={() => onDeleteModel(model.id)} disabled={!model.downloaded || model.loaded} title="Delete model" className="rounded-md border border-zinc-800 p-2 text-zinc-400 disabled:opacity-30"><Trash2 className="h-4 w-4" /></button>
             </div>
           </div>
-        ))}
+        );})}
         <button onClick={onUnload} className="mt-2 w-full rounded-md border border-zinc-800 px-3 py-2 text-sm font-bold text-zinc-300">Unload model</button>
       </div>
       <button onClick={() => onDeveloperMode(!developerMode)} className={`w-full rounded-md border px-3 py-3 text-sm font-black ${developerMode ? "border-lime-400 bg-lime-400 text-black" : "border-zinc-800 text-zinc-300"}`}>

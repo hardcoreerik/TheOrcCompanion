@@ -39,6 +39,10 @@ export interface LocalModelRecord {
   filename: string;
   url: string;
   sha256: string;
+  alignment: string;
+  description: string;
+  minimumRamBytes: number;
+  rawBase: boolean;
   recommended: boolean;
   downloaded: boolean;
   loaded: boolean;

@@ -109,6 +109,10 @@ public class LocalLlmPlugin extends Plugin {
         final String url;
         final String sha256;
         final String backendId;
+        final String alignment;
+        final String description;
+        final long minimumRamBytes;
+        final boolean rawBase;
         final boolean recommended;
         final boolean experimental;
         final boolean supportsMultiTurn;
@@ -124,6 +128,10 @@ public class LocalLlmPlugin extends Plugin {
             String url,
             String sha256,
             String backendId,
+            String alignment,
+            String description,
+            long minimumRamBytes,
+            boolean rawBase,
             boolean recommended,
             boolean experimental,
             boolean supportsMultiTurn,
@@ -138,6 +146,10 @@ public class LocalLlmPlugin extends Plugin {
             this.url = url;
             this.sha256 = sha256;
             this.backendId = backendId;
+            this.alignment = alignment;
+            this.description = description;
+            this.minimumRamBytes = minimumRamBytes;
+            this.rawBase = rawBase;
             this.recommended = recommended;
             this.experimental = experimental;
             this.supportsMultiTurn = supportsMultiTurn;
@@ -158,8 +170,12 @@ public class LocalLlmPlugin extends Plugin {
                 "Qwen2.5 1.5B Instruct Q8",
                 "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
                 "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
-                "",
+                "faa60663b333290c1496c499828b21d3e3254a788cacd8cce917ce0f761a2dc9",
                 BACKEND_LITERT,
+                "Post-trained instruct",
+                "Best chat quality in the small curated set; slower and heavier than the 0.6B option.",
+                4_294_967_296L,
+                false,
                 true,
                 false,
                 true,
@@ -178,6 +194,10 @@ public class LocalLlmPlugin extends Plugin {
                 "https://huggingface.co/litert-community/Qwen3-0.6B/resolve/main/qwen3_0_6b_mixed_int4.litertlm",
                 "b1baab462f6be49d70eada79d715c2c52cd9ece0cad00bddf6a2c097d23498e9",
                 BACKEND_LITERT,
+                "Post-trained / preference aligned",
+                "Fast practical Android chat model with thinking and multilingual support.",
+                2_147_483_648L,
+                false,
                 false,
                 true,
                 true,
@@ -185,6 +205,50 @@ public class LocalLlmPlugin extends Plugin {
                 true,
                 true,
                 497_664_000L
+            )
+        );
+        MODEL_SPECS.put(
+            "smollm2-135m-instruct-litert",
+            new ModelSpec(
+                "smollm2-135m-instruct-litert",
+                "SmolLM2 135M Instruct",
+                "SmolLM2_135M_Instruct.litertlm",
+                "https://huggingface.co/litert-community/SmolLM2-135M-Instruct/resolve/main/SmolLM2_135M_Instruct.litertlm",
+                "ccdc5c85735743f081b7d44ca309cab569f76c0f2f0e8e163449a63721969c37",
+                BACKEND_LITERT,
+                "SFT + DPO",
+                "Tiny 143 MB starter model. Very fast, but substantially less capable than Qwen.",
+                1_073_741_824L,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                142_819_328L
+            )
+        );
+        MODEL_SPECS.put(
+            "qwen3-1.7b-litert",
+            new ModelSpec(
+                "qwen3-1.7b-litert",
+                "Qwen3 1.7B",
+                "Qwen3_1.7B.litertlm",
+                "https://huggingface.co/litert-community/Qwen3-1.7B/resolve/main/Qwen3_1.7B.litertlm",
+                "66064a4e9269cb693e124c4e3040bcb8a446b10bca42663896329495add3861c",
+                BACKEND_LITERT,
+                "Post-trained / preference aligned",
+                "More capable Qwen3 option for high-memory phones; 2.1 GB download.",
+                4_294_967_296L,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                2_056_729_520L
             )
         );
     }
@@ -199,6 +263,7 @@ public class LocalLlmPlugin extends Plugin {
     private volatile boolean modelLoaded = false;
     private volatile String loadedModelId = "";
     private volatile String loadedBackend = "";
+    private volatile String activeDownloadModelId = "";
     private SpeechRecognizer speechRecognizer;
     private TextToSpeech textToSpeech;
 
@@ -729,6 +794,20 @@ public class LocalLlmPlugin extends Plugin {
             call.reject("This model requires a backend that is not available in this build.");
             return;
         }
+        if (!activeDownloadModelId.isEmpty()) {
+            call.reject("Another model download is already running.");
+            return;
+        }
+
+        File partialFile = new File(getModelsDir(), spec.filename + ".part");
+        File finalFile = getModelFile(spec);
+        long remainingBytes = Math.max(0, spec.downloadSizeBytes - (partialFile.exists() ? partialFile.length() : 0));
+        long availableBytes = new StatFs(getModelsDir().getAbsolutePath()).getAvailableBytes();
+        if (!finalFile.exists() && availableBytes < remainingBytes + 67_108_864L) {
+            call.reject("Not enough free storage for this model download.");
+            return;
+        }
+        activeDownloadModelId = modelId;
 
         call.resolve(new JSObject()
             .put("started", true)
@@ -738,8 +817,6 @@ public class LocalLlmPlugin extends Plugin {
         worker.submit(() -> {
             notifyLoadState(spec, "downloading", null, true, null);
             try {
-                File partialFile = new File(getModelsDir(), spec.filename + ".part");
-                File finalFile = getModelFile(spec);
                 if (finalFile.exists()) {
                     verifyChecksum(spec, finalFile);
                     emitDownloadProgress(spec, finalFile.length(), finalFile.length());
@@ -760,11 +837,20 @@ public class LocalLlmPlugin extends Plugin {
                     connection.setRequestProperty("Range", "bytes=" + existingBytes + "-");
                 }
 
+                int responseCode = connection.getResponseCode();
+                if (responseCode != HttpURLConnection.HTTP_OK && responseCode != HttpURLConnection.HTTP_PARTIAL) {
+                    throw new IllegalStateException("Model host returned HTTP " + responseCode + ".");
+                }
+                boolean restartDownload = existingBytes > 0 && responseCode == HttpURLConnection.HTTP_OK;
                 long contentLength = connection.getContentLengthLong();
-                long totalBytes = contentLength > 0 ? contentLength + existingBytes : spec.downloadSizeBytes;
+                long totalBytes = contentLength > 0 ? contentLength + (restartDownload ? 0 : existingBytes) : spec.downloadSizeBytes;
 
                 try (InputStream input = connection.getInputStream();
                      RandomAccessFile output = new RandomAccessFile(partialFile, "rw")) {
+                    if (restartDownload) {
+                        existingBytes = 0;
+                        output.setLength(0);
+                    }
                     output.seek(existingBytes);
                     byte[] buffer = new byte[1024 * 64];
                     long downloaded = existingBytes;
@@ -783,6 +869,8 @@ public class LocalLlmPlugin extends Plugin {
                 finalizeDownloadedModel(spec, partialFile, finalFile);
             } catch (Exception ex) {
                 notifyRuntimeError(null, spec, safeMessage(ex), true, "download_failed");
+            } finally {
+                activeDownloadModelId = "";
             }
         });
     }
@@ -1472,6 +1560,10 @@ public class LocalLlmPlugin extends Plugin {
             .put("filename", spec.filename)
             .put("url", spec.url)
             .put("sha256", spec.sha256)
+            .put("alignment", spec.alignment)
+            .put("description", spec.description)
+            .put("minimumRamBytes", spec.minimumRamBytes)
+            .put("rawBase", spec.rawBase)
             .put("recommended", spec.recommended)
             .put("downloaded", modelFile.exists())
             .put("loaded", modelLoaded && spec.id.equals(loadedModelId))
