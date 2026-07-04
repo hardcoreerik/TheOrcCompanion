@@ -1,12 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
+  Check,
   CheckCircle2,
   Copy,
   Download,
   Edit3,
-  GitBranch,
   HardDrive,
+  History,
   MessageSquare,
   Mic,
   Network,
@@ -18,6 +19,8 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
   Volume2,
   X,
@@ -177,6 +180,12 @@ const AGENT_SOAK_PROMPT = "Use web_search to find the official Google LiteRT-LM 
 const API_BASE = ((import.meta as any).env?.VITE_API_BASE ?? "").replace(/\/$/, "");
 const PRIMARY_GENERATION_IDLE_TIMEOUT_MS = 8_000;
 const PRIMARY_GENERATION_HARD_TIMEOUT_MS = 120_000;
+const MAX_ATTACHMENT_CHARS = 500;
+const MAX_MEMORY_CHARS = 180;
+const MAX_TRANSCRIPT_CHARS = 300;
+const MAX_TRANSCRIPT_MESSAGES = 6;
+const MAX_CURRENT_INPUT_CHARS = 700;
+const MAX_SYSTEM_MESSAGE_CHARS = 180;
 const SOAK_PROMPTS = [
   "Pick a one-word codename for this conversation.",
   "What does that codename mean to you in one short sentence?",
@@ -216,6 +225,12 @@ function readStoredJson<T>(key: string, fallback: T): T {
   }
 }
 
+function limitText(value: string, maxChars: number) {
+  const normalized = value.replace(/\s+\n/g, "\n").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars).trim()}\n\n[Truncated to fit the local model context window.]`;
+}
+
 async function readChatAttachment(file: File): Promise<ChatAttachment> {
   const id = `attachment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   if (file.type.startsWith("image/")) {
@@ -232,23 +247,23 @@ async function readChatAttachment(file: File): Promise<ChatAttachment> {
       pages.push(`[${file.name}, page ${pageNumber}]\n${content.items.map((item) => "str" in item ? item.str : "").join(" ")}`);
     }
     const text = pages.join("\n\n").replace(/\s+\n/g, "\n").trim();
-    return { id, name: file.name, type: file.type || "application/pdf", size: file.size, text: text.slice(0, 12_000) || `[PDF attached: ${file.name}; no extractable text found]` };
+    return { id, name: file.name, type: file.type || "application/pdf", size: file.size, text: limitText(text || `[PDF attached: ${file.name}; no extractable text found]`, MAX_ATTACHMENT_CHARS) };
   }
-  return { id, name: file.name, type: file.type || "text/plain", size: file.size, text: (await file.text()).slice(0, 12_000) };
+  return { id, name: file.name, type: file.type || "text/plain", size: file.size, text: limitText(await file.text(), MAX_ATTACHMENT_CHARS) };
 }
 
 function memoryContext(memories: MemoryRecord[]): LocalTranscriptMessage | null {
   if (memories.length === 0) return null;
   return {
     role: "system",
-    text: `User-approved memories:\n${memories.map((memory) => `- ${memory.text}`).join("\n")}`,
+    text: limitText(`User-approved memories:\n${memories.map((memory) => `- ${memory.text}`).join("\n")}`, MAX_MEMORY_CHARS),
     timestamp: new Date().toISOString(),
   };
 }
 
 function attachmentContext(attachments: ChatAttachment[]) {
   if (attachments.length === 0) return "";
-  return `Use attached material only when relevant. Cite it as [filename] or [filename, page N].\n\n${attachments.map((attachment) => `Attachment: ${attachment.name} (${attachment.type}, ${attachment.size} bytes)\n${attachment.text}`).join("\n\n")}`;
+  return limitText(`Use attached material only when relevant. Cite it as [filename] or [filename, page N].\n\n${attachments.map((attachment) => `Attachment: ${attachment.name} (${attachment.type}, ${attachment.size} bytes)\n${attachment.text}`).join("\n\n")}`, MAX_ATTACHMENT_CHARS);
 }
 
 function sourcesFromToolOutput(output: string): SourceReference[] {
@@ -267,11 +282,15 @@ function toTranscript(messages: Message[]) {
     .map<LocalTranscriptMessage>((message) => ({
       id: message.id,
       role: message.role,
-      text: [message.text, message.contextText].filter(Boolean).join("\n\n"),
+      text: limitText([message.text, message.contextText].filter(Boolean).join("\n\n"), MAX_CURRENT_INPUT_CHARS),
       timestamp: message.timestamp,
       backendId: message.backendId,
       modelId: message.modelId,
     }));
+}
+
+function transcriptTextLength(message: Message | LocalTranscriptMessage) {
+  return [message.text, "contextText" in message ? message.contextText : ""].filter(Boolean).join("\n\n").length;
 }
 
 function trimTranscript(messages: Message[]) {
@@ -280,11 +299,38 @@ function trimTranscript(messages: Message[]) {
   const kept: Message[] = [];
   for (let index = filtered.length - 1; index >= 0; index -= 1) {
     const message = filtered[index];
-    totalChars += message.text.length;
-    if (kept.length >= 32 || totalChars > 12_000) break;
+    const nextTotal = totalChars + transcriptTextLength(message);
+    if (kept.length >= MAX_TRANSCRIPT_MESSAGES || nextTotal > MAX_TRANSCRIPT_CHARS) break;
+    totalChars = nextTotal;
     kept.unshift(message);
   }
   return toTranscript(kept);
+}
+
+function packTranscriptForLocal(transcript: LocalTranscriptMessage[]) {
+  let remaining = MAX_TRANSCRIPT_CHARS;
+  const systemMessages: LocalTranscriptMessage[] = [];
+  const recentMessages: LocalTranscriptMessage[] = [];
+
+  for (const message of transcript) {
+    if (message.role !== "system" || remaining <= 0) continue;
+    const text = limitText(message.text, Math.min(MAX_SYSTEM_MESSAGE_CHARS, remaining));
+    if (!text) continue;
+    systemMessages.push({ ...message, text });
+    remaining -= text.length;
+  }
+
+  for (let index = transcript.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const message = transcript[index];
+    if (message.role === "system") continue;
+    const text = limitText(message.text, Math.min(MAX_CURRENT_INPUT_CHARS, remaining));
+    if (!text) continue;
+    recentMessages.unshift({ ...message, text });
+    remaining -= text.length;
+    if (recentMessages.length >= MAX_TRANSCRIPT_MESSAGES) break;
+  }
+
+  return [...systemMessages, ...recentMessages];
 }
 
 function normalizeText(value: string) {
@@ -386,6 +432,10 @@ function buildDirectDeviceReply(input: string, profile: DeviceProfile | null, ow
 function cleanupAssistantDisplayText(text: string) {
   if (!text.trim()) return text;
 
+  if (/```|`[^`]+`|\*\*[^*]+\*\*|^#{1,3}\s|^[-*]\s/m.test(text)) {
+    return text.trim();
+  }
+
   const withoutMarkdown = text
     .replace(/```/g, "")
     .replace(/\*\*/g, "")
@@ -422,6 +472,31 @@ function cleanupAssistantDisplayText(text: string) {
   }
 
   return collapsed.join(" ").replace(/\s{2,}/g, " ").trim();
+}
+
+function renderInlineMarkdown(text: string) {
+  return text.split(/(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^)]+\))/g).map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) return <code key={index} className="rounded bg-black/60 px-1 py-0.5 text-lime-200">{part.slice(1, -1)}</code>;
+    if (part.startsWith("**") && part.endsWith("**")) return <strong key={index}>{part.slice(2, -2)}</strong>;
+    const link = part.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/);
+    if (link) return <a key={index} href={link[2]} target="_blank" rel="noreferrer" className="text-cyan-300 underline">{link[1]}</a>;
+    return part;
+  });
+}
+
+function AssistantContent({ text }: { text: string }) {
+  const blocks = text.split(/```/);
+  return <div className="space-y-2 break-words">{blocks.map((block, index) => {
+    if (index % 2 === 1) {
+      const [language, ...code] = block.replace(/^\n/, "").split("\n");
+      return <pre key={index} className="overflow-x-auto rounded-md bg-black p-3 text-xs text-lime-200"><code>{code.length ? code.join("\n") : language}</code></pre>;
+    }
+    return block.split("\n").filter((line, lineIndex, lines) => line || (lineIndex > 0 && lines[lineIndex - 1])).map((line, lineIndex) => {
+      if (/^#{1,3}\s/.test(line)) return <h3 key={`${index}-${lineIndex}`} className="font-bold text-white">{renderInlineMarkdown(line.replace(/^#{1,3}\s+/, ""))}</h3>;
+      if (/^[-*]\s/.test(line)) return <div key={`${index}-${lineIndex}`} className="flex gap-2"><span>•</span><span>{renderInlineMarkdown(line.slice(2))}</span></div>;
+      return <p key={`${index}-${lineIndex}`} className="whitespace-pre-wrap">{renderInlineMarkdown(line)}</p>;
+    });
+  })}</div>;
 }
 
 function trustStateLabel(trustState: HiveTrustState) {
@@ -1112,11 +1187,11 @@ export default function App() {
     const history = approvedMemory ? [approvedMemory, ...baseHistory] : baseHistory;
     const currentAttachments = overrideText ? [] : attachments;
     const attachmentText = attachmentContext(currentAttachments);
-    const agentInput = [
+    const agentInput = limitText([
       searchMode === "search" ? "Search the web before answering and cite the returned sources." : "",
       text,
       attachmentText,
-    ].filter(Boolean).join("\n\n");
+    ].filter(Boolean).join("\n\n"), MAX_CURRENT_INPUT_CHARS);
     const resolvedOwnerName = ownerName.trim() || ownerNameAutoDetected.trim();
     const deviceContext = buildDeviceContextMessage(profile, resolvedOwnerName, batteryCutoff);
     const userMessage: Message = {
@@ -1153,7 +1228,7 @@ export default function App() {
         await LocalLlm.startGeneration({
           conversationId: PRIMARY_CONVERSATION_ID,
           message: agentInput,
-          transcript: deviceContext ? [deviceContext, ...history] : history,
+          transcript: packTranscriptForLocal(deviceContext ? [deviceContext, ...history] : history),
           modelId: loadedModel.id,
           backendId: chooseBackendId(loadedModel.backendId),
           options: { temperature: 0.5, topP: 0.9, nativeTools: true },
@@ -1261,7 +1336,7 @@ export default function App() {
       await LocalLlm.startGeneration({
         conversationId: PRIMARY_CONVERSATION_ID,
         message: agentInput,
-        transcript: deviceContext ? [deviceContext, ...history] : history,
+        transcript: packTranscriptForLocal(deviceContext ? [deviceContext, ...history] : history),
         modelId: loadedModel.id,
         backendId: chooseBackendId(loadedModel.backendId),
         options: { temperature: 0.7, topP: 0.9 },
@@ -1310,8 +1385,8 @@ export default function App() {
       try {
         await LocalLlm.startGeneration({
           conversationId,
-          message: input,
-          transcript,
+          message: limitText(input, MAX_CURRENT_INPUT_CHARS),
+          transcript: packTranscriptForLocal(transcript),
           modelId: model.id,
           backendId: chooseBackendId(model.backendId),
           options: { temperature, topP: 0.9 },
@@ -1757,6 +1832,7 @@ export default function App() {
               branches={branches}
               temporaryChat={temporaryChat}
               voiceListening={voiceListening}
+              canLoadModel={Boolean(recommendedModel?.downloaded)}
               onPromptChange={setPrompt}
               onSend={sendMessage}
               onStop={stopGeneration}
@@ -1770,7 +1846,11 @@ export default function App() {
               onCopy={(text) => void navigator.clipboard.writeText(text)}
               onRemember={(text) => setMemories((current) => current.some((memory) => memory.text === text) ? current : [...current, { id: `memory-${Date.now()}`, text, createdAt: new Date().toISOString() }])}
               onRestoreBranch={restoreBranch}
+              onRenameBranch={(id, label) => setBranches((current) => current.map((branch) => branch.id === id ? { ...branch, label } : branch))}
+              onDeleteBranch={(id) => setBranches((current) => current.filter((branch) => branch.id !== id))}
               onTemporaryChat={(enabled) => void changeTemporaryChat(enabled)}
+              onLoadModel={() => recommendedModel?.downloaded ? void loadSelectedModel(recommendedModel) : setActiveTab("settings")}
+              onOpenSettings={() => setActiveTab("settings")}
               onExport={exportChat}
               onVoiceInput={voiceListening ? () => void LocalLlm.stopVoiceInput().finally(() => setVoiceListening(false)) : startVoiceInput}
               onSpeak={(text) => void LocalLlm.speak({ text: cleanupAssistantDisplayText(text) })}
@@ -1924,6 +2004,7 @@ function ChatScreen(props: {
   branches: ChatBranch[];
   temporaryChat: boolean;
   voiceListening: boolean;
+  canLoadModel: boolean;
   onSearchMode: (mode: SearchMode) => void;
   onAttachments: (files: FileList | null) => void;
   onRemoveAttachment: (id: string) => void;
@@ -1933,13 +2014,29 @@ function ChatScreen(props: {
   onCopy: (text: string) => void;
   onRemember: (text: string) => void;
   onRestoreBranch: (id: string) => void;
+  onRenameBranch: (id: string, label: string) => void;
+  onDeleteBranch: (id: string) => void;
   onTemporaryChat: (enabled: boolean) => void;
+  onLoadModel: () => void;
+  onOpenSettings: () => void;
   onExport: () => void;
   onVoiceInput: () => void;
   onSpeak: (text: string) => void;
 }) {
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState("");
+  const [feedback, setFeedback] = useState<Record<string, "up" | "down">>({});
+  const suggestions = props.attachments.length > 0
+    ? ["Summarize the attachment", "List the key points", "Find action items", "Explain the document simply"]
+    : ["Help me think through an idea", "Explain something complex simply", "Plan my next steps", "Draft a concise message"];
+
+  function copyMessage(message: Message) {
+    props.onCopy(message.text);
+    setCopiedMessageId(message.id);
+    window.setTimeout(() => setCopiedMessageId((current) => current === message.id ? "" : current), 1500);
+  }
 
   useEffect(() => {
     const container = messageListRef.current;
@@ -1955,7 +2052,31 @@ function ChatScreen(props: {
   }, [props.prompt]);
 
   return (
-    <div className="flex min-h-[calc(100vh-9rem)] flex-col gap-2">
+    <div className="relative flex min-h-[calc(100vh-9rem)] flex-col gap-2">
+      {historyOpen && (
+        <div className="fixed inset-0 z-40 flex bg-black/70" onClick={() => setHistoryOpen(false)}>
+          <aside className="h-full w-[82%] max-w-sm overflow-y-auto border-r border-zinc-800 bg-[#050805] p-4" onClick={(event) => event.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="font-bold">Chat history</h2>
+              <button title="Close history" onClick={() => setHistoryOpen(false)} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><X className="h-4 w-4" /></button>
+            </div>
+            <button onClick={() => setHistoryOpen(false)} className="mb-2 w-full rounded-md border border-lime-400/40 bg-lime-400/10 p-3 text-left text-sm font-bold text-lime-200">Current chat</button>
+            <div className="space-y-2">
+              {props.branches.map((branch) => (
+                <div key={branch.id} className="flex items-center gap-1 rounded-md border border-zinc-800 bg-black/40 p-1">
+                  <button onClick={() => { props.onRestoreBranch(branch.id); setHistoryOpen(false); }} className="min-w-0 flex-1 px-2 py-2 text-left">
+                    <span className="block truncate text-sm font-bold">{branch.label}</span>
+                    <span className="text-xs text-zinc-500">{new Date(branch.createdAt).toLocaleString()}</span>
+                  </button>
+                  <button title="Rename chat" onClick={() => { const label = window.prompt("Rename chat", branch.label)?.trim(); if (label) props.onRenameBranch(branch.id, label); }} className="rounded p-2 text-zinc-400 hover:bg-zinc-900"><Edit3 className="h-4 w-4" /></button>
+                  <button title="Delete chat" onClick={() => { if (window.confirm(`Delete ${branch.label}?`)) props.onDeleteBranch(branch.id); }} className="rounded p-2 text-zinc-400 hover:bg-zinc-900 hover:text-red-300"><Trash2 className="h-4 w-4" /></button>
+                </div>
+              ))}
+              {props.branches.length === 0 && <p className="py-6 text-center text-sm text-zinc-500">No saved chat branches yet.</p>}
+            </div>
+          </aside>
+        </div>
+      )}
       {props.backendBanner && (
         <div className="rounded-md border border-cyan-400/40 bg-cyan-950/20 p-3 text-sm text-cyan-100">{props.backendBanner}</div>
       )}
@@ -1974,6 +2095,7 @@ function ChatScreen(props: {
               <p className="truncate text-xs text-zinc-500">{props.loadedModel?.name ?? "No local model loaded"}</p>
             </div>
             <div className="flex shrink-0 items-center gap-1">
+            <button onClick={() => setHistoryOpen(true)} title="Chat history" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><History className="h-4 w-4" /></button>
             <button onClick={() => props.onTemporaryChat(!props.temporaryChat)} title="Temporary chat" className={`rounded-md p-2 ${props.temporaryChat ? "bg-amber-400 text-black" : "text-zinc-400 hover:bg-zinc-900"}`}>
               <ShieldCheck className="h-4 w-4" />
             </button>
@@ -1981,29 +2103,33 @@ function ChatScreen(props: {
             <button onClick={props.onClear} title="Clear chat" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><Trash2 className="h-4 w-4" /></button>
             </div>
           </div>
-          <div className={`grid gap-2 ${props.branches.length > 0 ? "grid-cols-2" : "grid-cols-1"}`}>
-            <select aria-label="Chat mode" value={props.searchMode} onChange={(event) => props.onSearchMode(event.target.value as SearchMode)} className="min-w-0 rounded-md border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-300">
-              <option value="local">Local</option>
-              <option value="auto" disabled={!props.agentToolsEnabled}>Auto tools</option>
-              <option value="search" disabled={!props.agentToolsEnabled}>Web search</option>
-            </select>
-            {props.branches.length > 0 && (
-              <select aria-label="Restore chat branch" defaultValue="" onChange={(event) => { if (event.target.value) props.onRestoreBranch(event.target.value); event.target.value = ""; }} className="min-w-0 rounded-md border border-zinc-800 bg-black px-3 py-2 text-xs text-zinc-300">
-                <option value="">Branches ({props.branches.length})</option>
-                {props.branches.map((branch) => <option key={branch.id} value={branch.id}>{branch.label}</option>)}
-              </select>
-            )}
+          <div className="grid grid-cols-3 rounded-md border border-zinc-800 bg-black p-1">
+            {(["local", "auto", "search"] as SearchMode[]).map((mode) => (
+              <button key={mode} onClick={() => props.onSearchMode(mode)} disabled={mode !== "local" && !props.agentToolsEnabled} className={`rounded px-2 py-2 text-xs font-bold capitalize disabled:opacity-40 ${props.searchMode === mode ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>
+                {mode === "search" ? "Web" : mode}
+              </button>
+            ))}
           </div>
         </div>
         <div ref={messageListRef} className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1 py-3">
-          {props.messages.length === 0 ? (
+          {props.messages.length === 0 && !props.loadedModel ? (
+            <div className="m-auto w-full max-w-md px-4 py-8 text-center">
+              <img src={companionIcon} alt="" className="mx-auto h-14 w-14 rounded-md border border-lime-400/30" />
+              <h2 className="mt-5 text-xl font-semibold">Load a local model to start</h2>
+              <p className="mt-2 text-sm text-zinc-500">Chat runs privately on this phone.</p>
+              <div className="mt-5 grid grid-cols-2 gap-2">
+                <button onClick={props.onLoadModel} disabled={!props.canLoadModel} className="rounded-md bg-lime-400 px-4 py-3 text-sm font-black text-black disabled:opacity-40">Load model</button>
+                <button onClick={props.onOpenSettings} className="rounded-md border border-zinc-700 px-4 py-3 text-sm font-bold">Open settings</button>
+              </div>
+            </div>
+          ) : props.messages.length === 0 ? (
             <div className="m-auto w-full max-w-xl px-2 py-8 text-center">
               <img src={companionIcon} alt="" className="mx-auto h-14 w-14 rounded-2xl border border-lime-400/30" />
               <h2 className="mt-5 text-2xl font-semibold text-zinc-100">How can I help?</h2>
               <p className="mt-2 text-sm text-zinc-500">Private, local conversation on this device.</p>
               <div className="mt-7 grid grid-cols-2 gap-2 text-left">
-                {["Help me think through an idea", "Summarize an attached document", "Explain something complex simply", "Plan my next steps"].map((suggestion) => (
-                  <button key={suggestion} onClick={() => props.onPromptChange(suggestion)} className="rounded-2xl border border-zinc-800 bg-zinc-950/60 px-4 py-3 text-sm text-zinc-300 hover:border-zinc-600 hover:bg-zinc-900">
+                {suggestions.map((suggestion) => (
+                  <button key={suggestion} onClick={() => props.onPromptChange(suggestion)} className="rounded-md border border-zinc-800 bg-zinc-950/60 px-4 py-3 text-sm text-zinc-300 hover:border-zinc-600 hover:bg-zinc-900">
                     {suggestion}
                   </button>
                 ))}
@@ -2015,8 +2141,9 @@ function ChatScreen(props: {
                 <p className={`mb-2 text-[11px] font-bold uppercase tracking-[0.18em] ${message.role === "user" ? "text-black/60" : "text-zinc-500"}`}>
                   {message.role === "user" ? "You" : message.status === "error" ? "Error" : "Companion"}
                 </p>
-                <div className="break-words whitespace-pre-wrap">
-                  {(message.role === "assistant" ? cleanupAssistantDisplayText(message.text) : message.text) || (message.status === "streaming" ? (message.agentStatus ?? "Thinking...") : "")}
+                {message.status === "streaming" && <p className="mb-2 text-xs font-bold text-lime-300">{message.agentStatus ?? "Thinking..."}</p>}
+                <div className="break-words">
+                  {message.role === "assistant" ? <AssistantContent text={cleanupAssistantDisplayText(message.text)} /> : <p className="whitespace-pre-wrap">{message.text}</p>}
                   {message.status === "streaming" && (
                     <span className="ml-1 inline-block h-4 w-2 animate-pulse rounded-sm bg-lime-300/80 align-middle" />
                   )}
@@ -2028,10 +2155,12 @@ function ChatScreen(props: {
                 )}
                 {!message.status && (
                   <div className={`mt-3 flex flex-wrap gap-1 border-t pt-2 ${message.role === "user" ? "border-black/20" : "border-zinc-800"}`}>
-                    <button title="Copy" onClick={() => props.onCopy(message.text)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Copy className="h-3.5 w-3.5" /></button>
+                    <button title={copiedMessageId === message.id ? "Copied" : "Copy"} onClick={() => copyMessage(message)} className="rounded p-1.5 opacity-70 hover:opacity-100">{copiedMessageId === message.id ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}</button>
                     {message.role === "user" && <button title="Edit and branch" onClick={() => props.onEdit(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Edit3 className="h-3.5 w-3.5" /></button>}
                     {message.role === "user" && <button title="Remember this" onClick={() => props.onRemember(message.text)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Sparkles className="h-3.5 w-3.5" /></button>}
-                    {message.role === "assistant" && <button title="Regenerate on a new branch" onClick={() => props.onRegenerate(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><GitBranch className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Good response" aria-pressed={feedback[message.id] === "up"} onClick={() => setFeedback((current) => ({ ...current, [message.id]: "up" }))} className={`rounded p-1.5 opacity-70 hover:opacity-100 ${feedback[message.id] === "up" ? "text-lime-300 opacity-100" : ""}`}><ThumbsUp className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Bad response" aria-pressed={feedback[message.id] === "down"} onClick={() => setFeedback((current) => ({ ...current, [message.id]: "down" }))} className={`rounded p-1.5 opacity-70 hover:opacity-100 ${feedback[message.id] === "down" ? "text-red-300 opacity-100" : ""}`}><ThumbsDown className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Regenerate response" onClick={() => props.onRegenerate(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><RefreshCw className="h-3.5 w-3.5" /></button>}
                     {message.role === "assistant" && <button title="Read aloud" onClick={() => props.onSpeak(message.text)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Volume2 className="h-3.5 w-3.5" /></button>}
                     <button title="Delete message" onClick={() => props.onDelete(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Trash2 className="h-3.5 w-3.5" /></button>
                   </div>
@@ -2071,7 +2200,12 @@ function ChatScreen(props: {
             ))}
           </div>
         )}
-        <div className="flex gap-2 rounded-3xl border border-zinc-700 bg-zinc-950 p-2 shadow-lg shadow-black/30 focus-within:border-zinc-500">
+        <div className="rounded-2xl border border-zinc-700 bg-zinc-950 p-2 shadow-lg shadow-black/30 focus-within:border-zinc-500">
+          <div className="flex items-center gap-2 px-2 pb-1 text-[11px] text-zinc-500">
+            <span className={`rounded-full border px-2 py-0.5 ${props.loadedModel ? "border-lime-400/30 text-lime-300" : "border-zinc-700"}`}>{props.loadedModel ? `${props.loadedModel.name} · ${props.loadedModel.backend || "Ready"}` : "No model loaded"}</span>
+            {props.temporaryChat && <span>Temporary</span>}
+          </div>
+          <div className="flex gap-2">
           <label title="Attach photo, text, or PDF" className="flex cursor-pointer items-center rounded-full px-2 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200">
             <Paperclip className="h-5 w-5" />
             <input type="file" accept="image/*,.txt,.md,.json,.csv,.pdf,text/*,application/pdf" multiple className="hidden" onChange={(event) => { props.onAttachments(event.target.files); event.currentTarget.value = ""; }} />
@@ -2103,6 +2237,7 @@ function ChatScreen(props: {
               </button>
             </>
           )}
+          </div>
         </div>
       </section>
     </div>
