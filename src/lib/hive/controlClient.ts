@@ -37,12 +37,15 @@ export interface HiveTopologyNode {
   isMobile: boolean;
 }
 
-interface TaskStatus {
+export interface RemoteHiveTask {
+  host: string;
   taskId: string;
+  spec: string;
   status: string;
   result?: string;
   errorMsg?: string;
   claimedBy?: string;
+  submittedAt: string;
 }
 
 function requireAndroid() {
@@ -146,8 +149,7 @@ export async function getCompanionNodeId() {
   return (await HiveIdentity.getIdentity()).nodeId;
 }
 
-export async function runRemoteTask(host: string, spec: string): Promise<{ result: string; model: string; durationMs: number }> {
-  const started = Date.now();
+export async function submitRemoteTask(host: string, spec: string): Promise<RemoteHiveTask> {
   const submitted = await taskRequest<{ taskId: string }>(host, "POST", "/hive/tasks/submit", {
     role: "Researcher",
     title: spec.split("\n", 1)[0].slice(0, 80) || "Companion request",
@@ -155,12 +157,10 @@ export async function runRemoteTask(host: string, spec: string): Promise<{ resul
     projectGoal: "Requested remotely from TheOrc Companion",
     timeoutMs: 300_000,
   });
+  return { host, taskId: submitted.taskId, spec, status: "pending", submittedAt: new Date().toISOString() };
+}
 
-  for (let attempt = 0; attempt < 600; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 500));
-    const task = await taskRequest<TaskStatus>(host, "GET", `/hive/tasks/${submitted.taskId}`);
-    if (task.status === "completed") return { result: task.result ?? "Task completed.", model: task.claimedBy ?? "HIVE", durationMs: Date.now() - started };
-    if (!["pending", "claimed", "verifying"].includes(task.status)) throw new Error(task.errorMsg || `HIVE task ${task.status}.`);
-  }
-  throw new Error("HIVE task timed out after 5 minutes.");
+export async function getRemoteTask(task: RemoteHiveTask): Promise<RemoteHiveTask> {
+  const status = await taskRequest<Omit<RemoteHiveTask, "host" | "spec" | "submittedAt">>(task.host, "GET", `/hive/tasks/${task.taskId}`);
+  return { ...task, ...status };
 }

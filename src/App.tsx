@@ -51,7 +51,7 @@ import { runAgentLoop } from "./lib/agent/runAgentLoop";
 import { executeTool, toolActivityLabel } from "./lib/agent/toolRegistry";
 import type { SourceReference, ToolActivityEntry } from "./lib/agent/types";
 import { HiveWorkerAgentClient } from "./lib/hive/workerAgent";
-import { confirmPairedNode, forgetPairedNode, getCompanionNodeId, getControlStatus, getPairedNode, pairWithNode, runRemoteTask, type HiveTopologyNode } from "./lib/hive/controlClient";
+import { confirmPairedNode, forgetPairedNode, getCompanionNodeId, getControlStatus, getPairedNode, getRemoteTask, pairWithNode, submitRemoteTask, type HiveTopologyNode, type RemoteHiveTask } from "./lib/hive/controlClient";
 import companionIcon from "../assets/02_app_icon.png";
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
@@ -175,6 +175,7 @@ const MEMORY_ENABLED_STORAGE_KEY = "orc-companion-memory-enabled";
 const BRANCH_STORAGE_KEY = "orc-companion-branches-v1";
 const TEMPORARY_CHAT_STORAGE_KEY = "orc-companion-temporary-chat";
 const WORKER_MODE_STORAGE_KEY = "orc-companion-hive-worker-mode";
+const REMOTE_TASK_STORAGE_KEY = "orc-companion-hive-remote-task";
 const WORKER_LANES_DEFAULT = ["researcher"];
 const SOAK_SCRIPT_ID = "linked-15-turn-memory";
 const AGENT_SOAK_PROMPT = "Use web_search to find the official Google LiteRT-LM Android documentation page, then give me one real URL from the results.";
@@ -583,7 +584,7 @@ export default function App() {
   const [controlError, setControlError] = useState("");
   const [controlStatus, setControlStatus] = useState<{ nodeName: string; models: string[]; lanes: string[]; topology: { center: HiveTopologyNode; peers: HiveTopologyNode[] } } | null>(null);
   const [remoteCommandSpec, setRemoteCommandSpec] = useState("");
-  const [remoteCommandResult, setRemoteCommandResult] = useState("");
+  const [remoteTask, setRemoteTask] = useState<RemoteHiveTask | null>(() => readStoredJson<RemoteHiveTask | null>(REMOTE_TASK_STORAGE_KEY, null));
   const [workerModeEnabled, setWorkerModeEnabled] = useState(() => readStoredJson<boolean>(WORKER_MODE_STORAGE_KEY, true));
   const [workerAgentRunning, setWorkerAgentRunning] = useState(false);
   const [workerLog, setWorkerLog] = useState<string[]>([]);
@@ -1722,6 +1723,29 @@ export default function App() {
   }, [workerModeEnabled]);
 
   useEffect(() => {
+    if (remoteTask) localStorage.setItem(REMOTE_TASK_STORAGE_KEY, JSON.stringify(remoteTask));
+    else localStorage.removeItem(REMOTE_TASK_STORAGE_KEY);
+  }, [remoteTask]);
+
+  useEffect(() => {
+    if (!remoteTask || !["pending", "claimed", "verifying"].includes(remoteTask.status)) return;
+    let cancelled = false;
+    let timer: number | undefined;
+    const refresh = async () => {
+      try {
+        const next = await getRemoteTask(remoteTask);
+        if (!cancelled) setRemoteTask((current) => current?.taskId === next.taskId ? next : current);
+      } catch (error: any) {
+        if (!cancelled) setControlError(error?.message || "Unable to refresh the HIVE task.");
+      } finally {
+        if (!cancelled) timer = window.setTimeout(() => void refresh(), 2_000);
+      }
+    };
+    void refresh();
+    return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
+  }, [remoteTask?.host, remoteTask?.taskId, remoteTask?.status]);
+
+  useEffect(() => {
     return () => {
       workerAgentRef.current?.stop();
     };
@@ -1775,12 +1799,11 @@ export default function App() {
     if (!activeRoute || !remoteCommandSpec.trim()) return;
     setControlBusy(true);
     setControlError("");
-    setRemoteCommandResult("");
     try {
-      const response = await runRemoteTask(activeRoute.host, remoteCommandSpec.trim());
-      setRemoteCommandResult(response.result);
+      setRemoteTask(await submitRemoteTask(activeRoute.host, remoteCommandSpec.trim()));
+      setRemoteCommandSpec("");
     } catch (error: any) {
-      setControlError(error?.message || "Remote command failed.");
+      setControlError(error?.message || "Remote task submission failed.");
     } finally {
       setControlBusy(false);
     }
@@ -1937,9 +1960,10 @@ export default function App() {
               onUnpair={unpairActiveNode}
               onRefreshControlStatus={() => void refreshControlStatus()}
               remoteCommandSpec={remoteCommandSpec}
-              remoteCommandResult={remoteCommandResult}
+              remoteTask={remoteTask}
               onRemoteCommandSpec={setRemoteCommandSpec}
               onRunRemoteCommand={() => void runCommandOnActiveNode()}
+              onClearRemoteTask={() => setRemoteTask(null)}
               workerModeEnabled={workerModeEnabled}
               workerAgentRunning={workerAgentRunning}
               workerLog={workerLog}
@@ -2311,7 +2335,7 @@ function SetupRow({ label, value, ok }: { label: string; value: string; ok: bool
   );
 }
 
-function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, observations, diagnostics, developerMode, onRefresh, onSelect, onProbe, onPrepareObserver, onPreparePairing, onRevoke, onRunDiagnostics, isPairedWithActiveNode, controlBusy, controlError, controlStatus, onPair, onUnpair, onRefreshControlStatus, remoteCommandSpec, remoteCommandResult, onRemoteCommandSpec, onRunRemoteCommand, workerModeEnabled, workerAgentRunning, workerLog, hasLoadedModel, onToggleWorkerMode }: {
+function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, observations, diagnostics, developerMode, onRefresh, onSelect, onProbe, onPrepareObserver, onPreparePairing, onRevoke, onRunDiagnostics, isPairedWithActiveNode, controlBusy, controlError, controlStatus, onPair, onUnpair, onRefreshControlStatus, remoteCommandSpec, remoteTask, onRemoteCommandSpec, onRunRemoteCommand, onClearRemoteTask, workerModeEnabled, workerAgentRunning, workerLog, hasLoadedModel, onToggleWorkerMode }: {
   routes: HiveRoute[];
   activeRoute: HiveRoute | null;
   probe: HiveProbeResult | null;
@@ -2336,9 +2360,10 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
   onUnpair: () => void;
   onRefreshControlStatus: () => void;
   remoteCommandSpec: string;
-  remoteCommandResult: string;
+  remoteTask: RemoteHiveTask | null;
   onRemoteCommandSpec: (value: string) => void;
   onRunRemoteCommand: () => void;
+  onClearRemoteTask: () => void;
   workerModeEnabled: boolean;
   workerAgentRunning: boolean;
   workerLog: string[];
@@ -2351,6 +2376,8 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
   const canPrepareObserver = activeRoute?.trustState === "unpaired_observer";
   const canPreparePairing = activeRoute?.trustState === "pairing_ready";
   const androidControl = Capacitor.getPlatform() === "android";
+  const visibleRemoteTask = remoteTask?.host === activeRoute?.host ? remoteTask : null;
+  const remoteTaskActive = Boolean(visibleRemoteTask && ["pending", "claimed", "verifying"].includes(visibleRemoteTask.status));
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -2477,11 +2504,20 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
                 rows={2}
                 className="w-full resize-none rounded-md border border-cyan-400/30 bg-black px-3 py-2 text-sm text-cyan-50 outline-none"
               />
-              <button onClick={onRunRemoteCommand} disabled={controlBusy || !remoteCommandSpec.trim()} className="w-full rounded-md bg-cyan-400 px-3 py-3 text-sm font-black text-black disabled:opacity-40">
-                {controlBusy ? "Running in HIVE..." : "Send to HIVE"}
+              <button onClick={onRunRemoteCommand} disabled={controlBusy || remoteTaskActive || !remoteCommandSpec.trim()} className="w-full rounded-md bg-cyan-400 px-3 py-3 text-sm font-black text-black disabled:opacity-40">
+                {controlBusy ? "Sending..." : remoteTaskActive ? "Task in progress" : "Send to HIVE"}
               </button>
-              {remoteCommandResult && (
-                <div className="rounded-md border border-cyan-400/20 bg-black/30 p-2 text-xs text-cyan-50 whitespace-pre-wrap">{remoteCommandResult}</div>
+              {visibleRemoteTask && (
+                <div className="space-y-2 rounded-md border border-cyan-400/20 bg-black/30 p-3 text-xs text-cyan-50">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-bold uppercase text-cyan-200">{visibleRemoteTask.status}</span>
+                    <button onClick={onClearRemoteTask} disabled={remoteTaskActive} title="Dismiss task" className="rounded p-1 text-zinc-400 hover:text-white disabled:opacity-30"><Trash2 className="h-4 w-4" /></button>
+                  </div>
+                  <p className="break-all text-zinc-500">{visibleRemoteTask.taskId}</p>
+                  <p className="text-zinc-300">{visibleRemoteTask.spec}</p>
+                  {visibleRemoteTask.result && <p className="whitespace-pre-wrap border-t border-cyan-400/20 pt-2">{visibleRemoteTask.result}</p>}
+                  {visibleRemoteTask.errorMsg && <p className="text-red-200">{visibleRemoteTask.errorMsg}</p>}
+                </div>
               )}
             </div>
           )}
