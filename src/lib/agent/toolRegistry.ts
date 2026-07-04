@@ -2,7 +2,6 @@ import { getDeviceProfileSnapshot } from "../tools/deviceTools";
 import { formatFetchPageForLlm, fetchPage } from "../tools/fetchPage";
 import { probeHiveRoute, queueScrapeUrlJob } from "../tools/hiveTools";
 import { formatWebSearchForLlm, webSearch } from "../tools/webSearch";
-import { LocalLlm } from "../localLlm";
 import type { ToolDefinition, ToolExecutionContext } from "./types";
 
 function readStringArg(args: Record<string, unknown>, key: string, fallback = "") {
@@ -76,6 +75,7 @@ const TOOL_DEFINITIONS: ToolDefinition[] = [
       const payload = args.payload && typeof args.payload === "object" ? args.payload as Record<string, unknown> : {};
       const approved = window.confirm(`Allow TheOrc Companion to ${action.replaceAll("_", " ")}?\n\n${JSON.stringify(payload, null, 2)}`);
       if (!approved) return "The user declined the Android action.";
+      const { LocalLlm } = await import("../localLlm");
       const result = await LocalLlm.performDeviceAction({ action, payload, confirmed: true });
       return result.detail;
     },

@@ -1,6 +1,7 @@
 package com.hardcoreerik.theorccompanion;
 
 import android.Manifest;
+import android.app.Activity;
 import android.app.ActivityManager;
 import android.content.Context;
 import android.content.Intent;
@@ -637,7 +638,9 @@ public class LocalLlmPlugin extends Plugin {
     }
 
     private void beginVoiceInput(PluginCall call) {
-        getActivity().runOnUiThread(() -> {
+        Activity activity = attachedActivity(call);
+        if (activity == null) return;
+        activity.runOnUiThread(() -> {
             if (!SpeechRecognizer.isRecognitionAvailable(getContext())) {
                 call.reject("Speech recognition is unavailable on this device.");
                 return;
@@ -676,7 +679,9 @@ public class LocalLlmPlugin extends Plugin {
 
     @PluginMethod
     public void stopVoiceInput(PluginCall call) {
-        getActivity().runOnUiThread(() -> {
+        Activity activity = attachedActivity(call);
+        if (activity == null) return;
+        activity.runOnUiThread(() -> {
             if (speechRecognizer != null) speechRecognizer.stopListening();
             call.resolve(new JSObject().put("stopped", true));
         });
@@ -689,7 +694,9 @@ public class LocalLlmPlugin extends Plugin {
             call.reject("Speech text is required.");
             return;
         }
-        getActivity().runOnUiThread(() -> {
+        Activity activity = attachedActivity(call);
+        if (activity == null) return;
+        activity.runOnUiThread(() -> {
             if (textToSpeech == null) {
                 textToSpeech = new TextToSpeech(getContext(), status -> {
                     if (status == TextToSpeech.SUCCESS) textToSpeech.speak(text, TextToSpeech.QUEUE_FLUSH, null, "companion-chat");
@@ -699,6 +706,12 @@ public class LocalLlmPlugin extends Plugin {
             }
             call.resolve(new JSObject().put("started", true));
         });
+    }
+
+    private Activity attachedActivity(PluginCall call) {
+        Activity activity = getActivity();
+        if (activity == null) call.reject("Activity is unavailable.");
+        return activity;
     }
 
     @PluginMethod

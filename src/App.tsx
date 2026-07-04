@@ -267,6 +267,10 @@ function attachmentContext(attachments: ChatAttachment[]) {
   return limitText(`Use attached material only when relevant. Cite it as [filename] or [filename, page N].\n\n${attachments.map((attachment) => `Attachment: ${attachment.name} (${attachment.type}, ${attachment.size} bytes)\n${attachment.text}`).join("\n\n")}`, MAX_ATTACHMENT_CHARS);
 }
 
+function revokeAttachmentPreviews(attachments: ChatAttachment[]) {
+  attachments.forEach((attachment) => attachment.previewUrl && URL.revokeObjectURL(attachment.previewUrl));
+}
+
 function sourcesFromToolOutput(output: string): SourceReference[] {
   const lines = output.split("\n");
   return lines.flatMap((line, index) => {
@@ -639,7 +643,7 @@ export default function App() {
       const parsed = JSON.parse(result.value);
       if (Array.isArray(parsed)) setMessages(parsed);
     }).catch(() => setRuntimeError("Encrypted chat history could not be loaded.")).finally(() => { secureChatHydratedRef.current = true; });
-  }, [nativeAvailable]);
+  }, [nativeAvailable, temporaryChat]);
 
   useEffect(() => {
     localStorage.setItem(SEARCH_MODE_STORAGE_KEY, JSON.stringify(searchMode));
@@ -1104,7 +1108,11 @@ export default function App() {
     if (!fileList) return;
     try {
       const next = await Promise.all([...fileList].slice(0, 3).map(readChatAttachment));
-      setAttachments((current) => [...current, ...next].slice(0, 3));
+      setAttachments((current) => {
+        const combined = [...current, ...next];
+        revokeAttachmentPreviews(combined.slice(3));
+        return combined.slice(0, 3);
+      });
     } catch (error: any) {
       setRuntimeError(error?.message || "Unable to read that attachment.");
     }
@@ -1218,7 +1226,7 @@ export default function App() {
 
     setPrompt("");
     setAttachments([]);
-    currentAttachments.forEach((attachment) => attachment.previewUrl && URL.revokeObjectURL(attachment.previewUrl));
+    revokeAttachmentPreviews(currentAttachments);
     setRuntimeError("");
     setIsGenerating(true);
     setMessages((current) => [...current, userMessage, assistantMessage]);
@@ -1837,10 +1845,10 @@ export default function App() {
               onPromptChange={setPrompt}
               onSend={sendMessage}
               onStop={stopGeneration}
-              onClear={() => { setMessages([]); void LocalLlm.deleteSecureText({ key: "chat-history" }); localStorage.removeItem(CHAT_STORAGE_KEY); }}
+              onClear={() => { setMessages([]); setAttachments((current) => { revokeAttachmentPreviews(current); return []; }); void LocalLlm.deleteSecureText({ key: "chat-history" }); localStorage.removeItem(CHAT_STORAGE_KEY); }}
               onSearchMode={setSearchMode}
               onAttachments={addAttachments}
-              onRemoveAttachment={(id) => setAttachments((current) => current.filter((attachment) => attachment.id !== id))}
+              onRemoveAttachment={(id) => setAttachments((current) => { revokeAttachmentPreviews(current.filter((attachment) => attachment.id === id)); return current.filter((attachment) => attachment.id !== id); })}
               onEdit={editMessage}
               onRegenerate={regenerateMessage}
               onDelete={(id) => { snapshotBranch("Before delete"); setMessages((current) => current.filter((message) => message.id !== id)); }}
