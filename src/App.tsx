@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
+import { Capacitor } from "@capacitor/core";
 import {
   Bot,
   CheckCircle2,
@@ -38,7 +39,7 @@ import {
 import { runAgentLoop } from "./lib/agent/runAgentLoop";
 import type { ToolActivityEntry } from "./lib/agent/types";
 import { HiveWorkerAgentClient } from "./lib/hive/workerAgent";
-import { forgetPairedNode, getControlStatus, getPairedNode, pairWithNode, runRemoteTask } from "./lib/hive/controlClient";
+import { approveRemoteAction, closeRemoteTerminal, confirmPairedNode, getCompanionNodeId, getControlStatus, getPairedNode, openRemoteTerminal, pairWithNode, readRemoteTerminal, revokePairedNode, runRemoteTask, writeRemoteTerminal, type HiveTopologyNode } from "./lib/hive/controlClient";
 import companionIcon from "../assets/02_app_icon.png";
 
 type AppTab = "chat" | "hive" | "jobs" | "settings";
@@ -369,7 +370,7 @@ function trustStateLabel(trustState: HiveTrustState) {
     case "pairing_ready":
       return "Approved locally";
     case "paired_member_pending_server_enforcement":
-      return "Pairing prepared";
+      return "Paired member";
     case "blocked_untrusted":
       return "Blocked";
     default:
@@ -423,10 +424,10 @@ export default function App() {
 
   const [controlBusy, setControlBusy] = useState(false);
   const [controlError, setControlError] = useState("");
-  const [controlStatus, setControlStatus] = useState<{ nodeName: string; models: string[]; lanes: string[] } | null>(null);
+  const [controlStatus, setControlStatus] = useState<{ nodeName: string; models: string[]; lanes: string[]; topology: { center: HiveTopologyNode; peers: HiveTopologyNode[] } } | null>(null);
   const [remoteCommandSpec, setRemoteCommandSpec] = useState("");
   const [remoteCommandResult, setRemoteCommandResult] = useState("");
-  const [workerModeEnabled, setWorkerModeEnabled] = useState(() => readStoredJson<boolean>(WORKER_MODE_STORAGE_KEY, false));
+  const [workerModeEnabled, setWorkerModeEnabled] = useState(() => readStoredJson<boolean>(WORKER_MODE_STORAGE_KEY, true));
   const [workerAgentRunning, setWorkerAgentRunning] = useState(false);
   const [workerLog, setWorkerLog] = useState<string[]>([]);
   const workerAgentRef = useRef<HiveWorkerAgentClient | null>(null);
@@ -610,7 +611,17 @@ export default function App() {
       });
       setHiveError("");
     } catch {
-      setRoutes([]);
+      const storedHost = readStoredJson<string | null>(HIVE_ROUTE_STORAGE_KEY, null);
+      const directRoute: HiveRoute | null = storedHost
+        ? {
+            kind: "lan", label: "Direct HIVE node", host: storedHost,
+            companionUrl: `http://${storedHost}:7077`, hiveInfoUrl: `http://${storedHost}:7078/hive/info`,
+            ollamaUrl: `http://${storedHost}:11434`, trustState: "pairing_ready",
+            visibilityState: "visible", serverEnforcementKnown: false,
+          }
+        : null;
+      setRoutes(directRoute ? [directRoute] : []);
+      setActiveRoute(directRoute);
       setKnownPeers([]);
       setObservations([]);
     }
@@ -1169,6 +1180,29 @@ export default function App() {
     setHiveProbe(null);
     setHiveError("");
     try {
+      if (Capacitor.getPlatform() === "android" && getPairedNode(route.host)) {
+        const started = performance.now();
+        const status = await getControlStatus(route.host);
+        setHiveProbe({
+          status: "optimal",
+          latency: Math.round(performance.now() - started),
+          endpoints: { hiveInfoUrl: route.hiveInfoUrl, ollamaTagsUrl: `${route.ollamaUrl}/api/tags`, companionUrl: route.companionUrl },
+          ollama: { reachable: true, modelCount: status.info.models?.length ?? 0, models: status.info.models ?? [] },
+          hiveNode: { Name: status.nodeName, Lanes: status.info.lanes ?? [] },
+          trustState: "paired_member_pending_server_enforcement",
+          visibilityState: "approved_locally",
+          serverEnforcementKnown: true,
+          protocolContext: {
+            protocolVersion: "hive-control-v1", clientRole: "companion_mobile",
+            trustState: "paired_member_pending_server_enforcement", capabilityIntent: ["control", "worker"],
+            peerId: `peer:${route.host}`, nonce: "native", timestamp: new Date().toISOString(),
+            authPresent: true, signatureHeader: "native-keystore",
+          },
+          testLog: [`Authenticated encrypted HIVE control responded as ${status.nodeName}.`],
+        });
+        await refreshControlStatus();
+        return;
+      }
       const response = await fetch(apiUrl("/api/hive/test-connection"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1304,7 +1338,10 @@ export default function App() {
     setControlBusy(true);
     setControlError("");
     try {
-      await pairWithNode(activeRoute.host, profile?.deviceLabel || ownerName.trim() || "Companion");
+      const pending = await pairWithNode(activeRoute.host, profile?.deviceLabel || ownerName.trim() || "Companion");
+      if (!window.confirm(`Confirm this fingerprint matches TheOrc's HIVE screen:\n\n${pending.fingerprint}`))
+        throw new Error("Pairing cancelled: fingerprint was not confirmed.");
+      await confirmPairedNode(pending);
       await refreshControlStatus();
     } catch (error: any) {
       setControlError(error?.message || "Pairing failed. Enable 'Allow phone pairing' on the desktop node first.");
@@ -1313,9 +1350,9 @@ export default function App() {
     }
   }
 
-  function unpairActiveNode() {
+  async function unpairActiveNode() {
     if (!activeRoute) return;
-    forgetPairedNode(activeRoute.host);
+    await revokePairedNode(activeRoute.host);
     setControlStatus(null);
     setControlError("");
   }
@@ -1324,7 +1361,15 @@ export default function App() {
     if (!activeRoute) return;
     try {
       const status = await getControlStatus(activeRoute.host);
-      setControlStatus({ nodeName: status.nodeName, models: status.info.Models, lanes: status.info.Lanes });
+      setControlStatus({
+        nodeName: status.nodeName,
+        models: status.info.models ?? [],
+        lanes: status.info.lanes ?? [],
+        topology: status.topology ?? {
+          center: { nodeId: "host", name: status.nodeName, role: "warchief", state: "online", isMobile: false },
+          peers: [],
+        },
+      });
       setControlError("");
     } catch (error: any) {
       setControlStatus(null);
@@ -1347,11 +1392,12 @@ export default function App() {
     }
   }
 
-  function startWorkerAgent() {
-    if (!activeRoute || !loadedModel || workerAgentRef.current?.isRunning) return;
+  async function startWorkerAgent() {
+    if (!activeRoute || !loadedModel || !getPairedNode(activeRoute.host) || workerAgentRef.current?.isRunning) return;
+    const workerId = await getCompanionNodeId();
     const agent = new HiveWorkerAgentClient({
       warchiefUrl: `http://${activeRoute.host}:7079`,
-      workerId: profile?.deviceLabel || ownerName.trim() || "TheOrcCompanion",
+      workerId,
       lanes: WORKER_LANES_DEFAULT,
       runInference: async (spec, role) => runSingleTurn(
         `hive-worker-${Date.now()}`,
@@ -1376,15 +1422,15 @@ export default function App() {
     const next = !workerModeEnabled;
     setWorkerModeEnabled(next);
     if (next) {
-      startWorkerAgent();
+      void startWorkerAgent();
     } else {
       stopWorkerAgent();
     }
   }
 
   useEffect(() => {
-    if (workerModeEnabled && loadedModel && activeRoute && !workerAgentRef.current?.isRunning) {
-      startWorkerAgent();
+    if (workerModeEnabled && loadedModel && activeRoute && getPairedNode(activeRoute.host) && !workerAgentRef.current?.isRunning) {
+      void startWorkerAgent();
     }
     if (workerModeEnabled && (!loadedModel || !activeRoute) && workerAgentRef.current?.isRunning) {
       stopWorkerAgent();
@@ -1790,7 +1836,7 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
   isPairedWithActiveNode: boolean;
   controlBusy: boolean;
   controlError: string;
-  controlStatus: { nodeName: string; models: string[]; lanes: string[] } | null;
+  controlStatus: { nodeName: string; models: string[]; lanes: string[]; topology: { center: HiveTopologyNode; peers: HiveTopologyNode[] } } | null;
   onPair: () => void;
   onUnpair: () => void;
   onRefreshControlStatus: () => void;
@@ -1809,6 +1855,7 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
     : null;
   const canPrepareObserver = activeRoute?.trustState === "unpaired_observer";
   const canPreparePairing = activeRoute?.trustState === "pairing_ready";
+  const androidControl = Capacitor.getPlatform() === "android";
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
@@ -1818,6 +1865,15 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
       <div className="rounded-md border border-amber-500/30 bg-amber-950/20 p-3 text-sm text-amber-100">
         Companion is observer-first here. Visibility over LAN or Tailscale does not equal trust, pairing, or remote enforcement.
       </div>
+      <button onClick={() => {
+        const host = window.prompt("TheOrc LAN IP or Tailscale hostname", activeRoute?.host ?? "");
+        if (!host) return;
+        if (!/^[a-z0-9.:[\]-]+$/i.test(host)) return window.alert("Enter a hostname or IP address only.");
+        localStorage.setItem(HIVE_ROUTE_STORAGE_KEY, JSON.stringify(host));
+        window.location.reload();
+      }} className="w-full rounded-md border border-zinc-700 px-3 py-3 text-sm font-bold text-zinc-200">
+        Add HIVE node
+      </button>
       {error && <div className="rounded-md border border-red-500/40 bg-red-950/20 p-3 text-sm text-red-200">{error}</div>}
       <div className="grid gap-2">
         {routes.length === 0 ? <p className="text-sm text-zinc-500">No desktop HIVE server is reachable from this build right now.</p> : routes.map((route) => (
@@ -1841,7 +1897,13 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
           </button>
         ))}
       </div>
-      {activeRoute && (
+      {activeRoute && !androidControl && (
+        <div className="rounded-md border border-zinc-800 bg-black/30 p-3 text-xs text-zinc-400">
+          Browser build: observer dashboard only. HIVE pairing, remote control, terminal access, and edge-worker identity require the Android app.
+        </div>
+      )}
+
+      {activeRoute && androidControl && (
         <div className="space-y-3 rounded-md border border-zinc-800 bg-[#050805] p-3">
           <div className="flex items-center justify-between gap-3">
             <div>
@@ -1874,7 +1936,7 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
         </div>
       )}
 
-      {activeRoute && (
+      {activeRoute && androidControl && (
         <div className="space-y-3 rounded-md border border-cyan-400/30 bg-cyan-950/10 p-3">
           <div className="flex items-center justify-between gap-2">
             <div>
@@ -1903,32 +1965,36 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
             )}
           </div>
           {controlStatus && (
-            <div className="rounded-md border border-cyan-400/20 bg-black/30 p-2 text-xs text-cyan-100">
-              <p>{controlStatus.nodeName} · models: {controlStatus.models.join(", ") || "none"}</p>
-              <p>Lanes: {controlStatus.lanes.join(", ") || "none"}</p>
-            </div>
+            <>
+              <HiveConstellation topology={controlStatus.topology} />
+              <div className="rounded-md border border-cyan-400/20 bg-black/30 p-2 text-xs text-cyan-100">
+                <p>{controlStatus.nodeName} · {controlStatus.models.length} models</p>
+                <p>Lanes: {controlStatus.lanes.join(", ") || "none"}</p>
+              </div>
+            </>
           )}
           {isPairedWithActiveNode && (
             <div className="space-y-2">
               <textarea
                 value={remoteCommandSpec}
                 onChange={(event) => onRemoteCommandSpec(event.target.value)}
-                placeholder="Tell this node what to do (runs directly on its own model, result returned here)"
+                placeholder="PowerShell command to run on this paired node"
                 rows={2}
                 className="w-full resize-none rounded-md border border-cyan-400/30 bg-black px-3 py-2 text-sm text-cyan-50 outline-none"
               />
               <button onClick={onRunRemoteCommand} disabled={controlBusy || !remoteCommandSpec.trim()} className="w-full rounded-md bg-cyan-400 px-3 py-3 text-sm font-black text-black disabled:opacity-40">
-                {controlBusy ? "Running on node..." : "Run on this node"}
+                {controlBusy ? "Running on node..." : "Run command"}
               </button>
               {remoteCommandResult && (
                 <div className="rounded-md border border-cyan-400/20 bg-black/30 p-2 text-xs text-cyan-50 whitespace-pre-wrap">{remoteCommandResult}</div>
               )}
+              <RemoteTerminal host={activeRoute.host} />
             </div>
           )}
         </div>
       )}
 
-      {activeRoute && (
+      {activeRoute && androidControl && (
         <div className="space-y-2 rounded-md border border-lime-400/20 bg-[#050805] p-3">
           <div className="flex items-center justify-between gap-2">
             <div>
@@ -1940,7 +2006,8 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
             </span>
           </div>
           {!hasLoadedModel && <p className="text-xs text-amber-300">Load a local model in Chat setup before joining as a worker.</p>}
-          <button onClick={onToggleWorkerMode} disabled={!hasLoadedModel} className={`w-full rounded-md border px-3 py-3 text-sm font-black disabled:opacity-40 ${workerModeEnabled ? "border-lime-400 bg-lime-400 text-black" : "border-zinc-800 text-zinc-300"}`}>
+          {!isPairedWithActiveNode && <p className="text-xs text-amber-300">Pair with this HIVE before worker mode can start.</p>}
+          <button onClick={onToggleWorkerMode} disabled={!hasLoadedModel || !isPairedWithActiveNode} className={`w-full rounded-md border px-3 py-3 text-sm font-black disabled:opacity-40 ${workerModeEnabled ? "border-lime-400 bg-lime-400 text-black" : "border-zinc-800 text-zinc-300"}`}>
             HIVE worker mode {workerModeEnabled ? "on" : "off"}
           </button>
           {workerLog.length > 0 && (
@@ -2003,6 +2070,101 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
           )}
         </div>
       )}
+    </div>
+  );
+}
+
+function HiveConstellation({ topology }: { topology: { center: HiveTopologyNode; peers: HiveTopologyNode[] } }) {
+  const nodes = topology.peers.map((node, index) => {
+    const angle = -Math.PI / 2 + (index * Math.PI * 2) / Math.max(topology.peers.length, 1);
+    return { ...node, x: 180 + Math.cos(angle) * 125, y: 170 + Math.sin(angle) * 115 };
+  });
+  const hex = (x: number, y: number, r: number) => Array.from({ length: 6 }, (_, i) => {
+    const a = -Math.PI / 2 + i * Math.PI / 3;
+    return `${x + Math.cos(a) * r},${y + Math.sin(a) * r}`;
+  }).join(" ");
+
+  return (
+    <div className="overflow-hidden rounded-xl border border-emerald-400/20 bg-[#061009]">
+      <svg viewBox="0 0 360 340" className="h-auto w-full" aria-label="HIVE node map">
+        <g stroke="#1d6b4e" strokeWidth="1" strokeDasharray="4 5" opacity=".45">
+          {nodes.map(node => <line key={node.nodeId} x1="180" y1="170" x2={node.x} y2={node.y} />)}
+        </g>
+        <circle cx="180" cy="170" r="49" fill="none" stroke="#21d995" opacity=".14" strokeWidth="10" />
+        <circle cx="180" cy="170" r="36" fill="none" stroke="#21d995" opacity=".28" strokeWidth="2" />
+        <polygon points={hex(180, 170, 25)} fill="#36dba0" stroke="#9affda" strokeWidth="2" />
+        <circle cx="174" cy="164" r="5" fill="#baffea" />
+        <path d="M163 139 L171 145 L180 138 L189 145 L197 139 L196 150 L164 150 Z" fill="#f2ce55" />
+        <text x="180" y="211" textAnchor="middle" fill="#d6fff0" fontSize="13" fontWeight="700">{topology.center.name}</text>
+        <text x="180" y="226" textAnchor="middle" fill="#2ddf9d" fontSize="9">warchief · online</text>
+        {nodes.map(node => {
+          const online = node.state === "online";
+          return <g key={node.nodeId}>
+            {online && <circle cx={node.x} cy={node.y} r="30" fill="#21d995" opacity=".12" />}
+            <polygon points={hex(node.x, node.y, 16)} fill={online ? "#35d99e" : "#30483d"} stroke={online ? "#83ffd1" : "#3d5b4e"} />
+            {online && <circle cx={node.x - 4} cy={node.y - 4} r="3" fill="#c9ffeb" />}
+            <text x={node.x} y={node.y + 30} textAnchor="middle" fill={online ? "#8fffd4" : "#47745f"} fontSize="10">{node.name}</text>
+            <text x={node.x} y={node.y + 43} textAnchor="middle" fill={online ? "#27b77f" : "#315846"} fontSize="8">{node.role} · {node.state}</text>
+          </g>;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function RemoteTerminal({ host }: { host: string }) {
+  const [terminalId, setTerminalId] = useState("");
+  const [status, setStatus] = useState("closed");
+  const [output, setOutput] = useState("");
+  const [offset, setOffset] = useState(0);
+  const [input, setInput] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!terminalId || !["open", "awaiting_approval"].includes(status)) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const snapshot = await readRemoteTerminal(host, terminalId, offset);
+        if (snapshot.output) setOutput((current) => current + snapshot.output);
+        setOffset(snapshot.offset);
+        setStatus(snapshot.status);
+      } catch (e: any) { setError(e?.message || "Terminal polling failed."); }
+    }, 750);
+    return () => window.clearInterval(timer);
+  }, [host, terminalId, offset, status]);
+
+  async function open() {
+    setError(""); setOutput(""); setOffset(0);
+    try {
+      const terminal = await openRemoteTerminal(host);
+      if (!window.confirm(`Open an interactive PowerShell session on ${host}?`)) {
+        await approveRemoteAction(host, terminal.id, false); return;
+      }
+      await approveRemoteAction(host, terminal.id, true);
+      setTerminalId(terminal.id); setStatus("open");
+    } catch (e: any) { setError(e?.message || "Unable to open terminal."); }
+  }
+
+  async function send() {
+    if (!terminalId || !input.trim()) return;
+    await writeRemoteTerminal(host, terminalId, input);
+    setInput("");
+  }
+
+  async function close() {
+    if (terminalId) await closeRemoteTerminal(host, terminalId).catch(() => undefined);
+    setTerminalId(""); setStatus("closed");
+  }
+
+  return (
+    <div className="space-y-2 border-t border-cyan-400/20 pt-3">
+      <div className="flex items-center justify-between"><strong className="text-xs text-cyan-100">Interactive terminal</strong><span className="text-xs text-zinc-500">{status}</span></div>
+      {!terminalId ? <button onClick={() => void open()} className="w-full rounded-md border border-cyan-400/40 px-3 py-2 text-xs font-bold text-cyan-100">Open terminal</button> : <>
+        <pre className="max-h-64 overflow-auto whitespace-pre-wrap rounded-md border border-zinc-800 bg-black p-2 text-xs text-lime-200">{output || "PowerShell ready."}</pre>
+        <div className="flex gap-2"><input value={input} onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") void send(); }} className="min-w-0 flex-1 rounded-md border border-zinc-700 bg-black px-2 py-2 text-xs text-zinc-100" placeholder="Enter command" /><button onClick={() => void send()} className="rounded-md bg-cyan-400 px-3 text-xs font-black text-black">Send</button></div>
+        <button onClick={() => void close()} className="w-full rounded-md border border-red-500/30 px-3 py-2 text-xs font-bold text-red-200">Close terminal</button>
+      </>}
+      {error && <p className="text-xs text-red-300">{error}</p>}
     </div>
   );
 }
