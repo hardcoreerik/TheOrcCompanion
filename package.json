@@ -9,6 +9,7 @@
     "start": "node dist/server.cjs",
     "clean": "node -e \"const fs=require('fs'); fs.rmSync('dist',{recursive:true,force:true}); fs.rmSync('server.js',{force:true});\"",
     "lint": "npm exec tsc -- --noEmit",
+    "test:agent": "node --import tsx --test src/lib/agent/*.test.ts src/lib/tools/*.test.ts",
     "android:sync": "npm run build && npx cap sync android",
     "android:open": "npx cap open android"
   },
@@ -23,6 +24,7 @@
     "express": "^4.21.2",
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
+    "pdfjs-dist": "^6.1.200",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "vite": "^6.2.3"

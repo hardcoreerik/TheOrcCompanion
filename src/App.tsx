@@ -1,12 +1,17 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
+  Check,
   CheckCircle2,
-  Cpu,
+  Copy,
   Download,
+  Edit3,
   HardDrive,
+  History,
   MessageSquare,
+  Mic,
   Network,
+  Paperclip,
   Play,
   RefreshCw,
   Send,
@@ -14,7 +19,11 @@ import {
   ShieldCheck,
   Sparkles,
   Square,
+  ThumbsDown,
+  ThumbsUp,
   Trash2,
+  Volume2,
+  X,
 } from "lucide-react";
 import {
   BackendId,
@@ -30,22 +39,33 @@ import {
   LocalModelRecord,
   LocalTranscriptMessage,
   ModelLoadState,
+  NativeToolCallEvent,
   RuntimeError,
   RuntimeStatus,
   SoakTestResult,
   TokenEvent,
+  VoiceResult,
 } from "./lib/localLlm";
 import { runAgentLoop } from "./lib/agent/runAgentLoop";
-import type { ToolActivityEntry } from "./lib/agent/types";
+import { executeTool, toolActivityLabel } from "./lib/agent/toolRegistry";
+import type { SourceReference, ToolActivityEntry } from "./lib/agent/types";
 import { HiveWorkerAgentClient } from "./lib/hive/workerAgent";
 import { forgetPairedNode, getControlStatus, getPairedNode, pairWithNode, runRemoteTask } from "./lib/hive/controlClient";
 import companionIcon from "../assets/02_app_icon.png";
+import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 
 type AppTab = "chat" | "hive" | "jobs" | "settings";
+type SearchMode = "local" | "auto" | "search";
+type ChatAttachment = { id: string; name: string; type: string; size: number; text: string; previewUrl?: string };
+type MemoryRecord = { id: string; text: string; createdAt: string };
+type ChatBranch = { id: string; label: string; createdAt: string; messages: Message[] };
 type Message = LocalTranscriptMessage & {
   id: string;
   toolActivity?: ToolActivityEntry[];
   agentStatus?: string;
+  sources?: SourceReference[];
+  attachments?: Array<Pick<ChatAttachment, "name" | "type" | "size">>;
+  contextText?: string;
 };
 type HiveTrustState = "unpaired_observer" | "pairing_ready" | "paired_member_pending_server_enforcement" | "blocked_untrusted";
 type HiveVisibilityState = "visible" | "approved_locally" | "blocked";
@@ -143,17 +163,30 @@ const SETUP_STORAGE_KEY = "orc-companion-setup-complete";
 const DEV_MODE_STORAGE_KEY = "orc-companion-dev-mode";
 const BACKEND_POLICY_KEY = "orc-companion-backend-policy";
 const PREFERRED_MODEL_KEY = "orc-companion-preferred-model";
+const LAST_LOADED_MODEL_KEY = "orc-companion-last-loaded-model";
 const HIVE_ROUTE_STORAGE_KEY = "orc-companion-hive-route";
 const OWNER_NAME_STORAGE_KEY = "orc-companion-owner-name";
 const AGENT_TOOLS_STORAGE_KEY = "orc-companion-agent-tools";
 const ALLOW_METERED_WEB_STORAGE_KEY = "orc-companion-allow-metered-web";
+const SEARCH_MODE_STORAGE_KEY = "orc-companion-search-mode";
+const MEMORY_STORAGE_KEY = "orc-companion-memory-v1";
+const MEMORY_ENABLED_STORAGE_KEY = "orc-companion-memory-enabled";
+const BRANCH_STORAGE_KEY = "orc-companion-branches-v1";
+const TEMPORARY_CHAT_STORAGE_KEY = "orc-companion-temporary-chat";
 const WORKER_MODE_STORAGE_KEY = "orc-companion-hive-worker-mode";
 const WORKER_LANES_DEFAULT = ["researcher"];
 const SOAK_SCRIPT_ID = "linked-15-turn-memory";
 const AGENT_SOAK_PROMPT = "Use web_search to find the official Google LiteRT-LM Android documentation page, then give me one real URL from the results.";
 const API_BASE = ((import.meta as any).env?.VITE_API_BASE ?? "").replace(/\/$/, "");
+const PRIMARY_GENERATION_FIRST_TOKEN_TIMEOUT_MS = 30_000;
 const PRIMARY_GENERATION_IDLE_TIMEOUT_MS = 8_000;
 const PRIMARY_GENERATION_HARD_TIMEOUT_MS = 120_000;
+const MAX_ATTACHMENT_CHARS = 500;
+const MAX_MEMORY_CHARS = 180;
+const MAX_TRANSCRIPT_CHARS = 300;
+const MAX_TRANSCRIPT_MESSAGES = 6;
+const MAX_CURRENT_INPUT_CHARS = 700;
+const MAX_SYSTEM_MESSAGE_CHARS = 180;
 const SOAK_PROMPTS = [
   "Pick a one-word codename for this conversation.",
   "What does that codename mean to you in one short sentence?",
@@ -193,6 +226,60 @@ function readStoredJson<T>(key: string, fallback: T): T {
   }
 }
 
+function limitText(value: string, maxChars: number) {
+  const normalized = value.replace(/\s+\n/g, "\n").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, maxChars).trim()}\n\n[Truncated to fit the local model context window.]`;
+}
+
+async function readChatAttachment(file: File): Promise<ChatAttachment> {
+  const id = `attachment-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  if (file.type.startsWith("image/")) {
+    return { id, name: file.name, type: file.type, size: file.size, text: `[Image attached: ${file.name}]`, previewUrl: URL.createObjectURL(file) };
+  }
+  if (file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf")) {
+    const pdfjs = await import("pdfjs-dist");
+    pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
+    const document = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+    const pages: string[] = [];
+    for (let pageNumber = 1; pageNumber <= Math.min(document.numPages, 25); pageNumber += 1) {
+      const page = await document.getPage(pageNumber);
+      const content = await page.getTextContent();
+      pages.push(`[${file.name}, page ${pageNumber}]\n${content.items.map((item) => "str" in item ? item.str : "").join(" ")}`);
+    }
+    const text = pages.join("\n\n").replace(/\s+\n/g, "\n").trim();
+    return { id, name: file.name, type: file.type || "application/pdf", size: file.size, text: limitText(text || `[PDF attached: ${file.name}; no extractable text found]`, MAX_ATTACHMENT_CHARS) };
+  }
+  return { id, name: file.name, type: file.type || "text/plain", size: file.size, text: limitText(await file.text(), MAX_ATTACHMENT_CHARS) };
+}
+
+function memoryContext(memories: MemoryRecord[]): LocalTranscriptMessage | null {
+  if (memories.length === 0) return null;
+  return {
+    role: "system",
+    text: limitText(`User-approved memories:\n${memories.map((memory) => `- ${memory.text}`).join("\n")}`, MAX_MEMORY_CHARS),
+    timestamp: new Date().toISOString(),
+  };
+}
+
+function attachmentContext(attachments: ChatAttachment[]) {
+  if (attachments.length === 0) return "";
+  return limitText(`Use attached material only when relevant. Cite it as [filename] or [filename, page N].\n\n${attachments.map((attachment) => `Attachment: ${attachment.name} (${attachment.type}, ${attachment.size} bytes)\n${attachment.text}`).join("\n\n")}`, MAX_ATTACHMENT_CHARS);
+}
+
+function revokeAttachmentPreviews(attachments: ChatAttachment[]) {
+  attachments.forEach((attachment) => attachment.previewUrl && URL.revokeObjectURL(attachment.previewUrl));
+}
+
+function sourcesFromToolOutput(output: string): SourceReference[] {
+  const lines = output.split("\n");
+  return lines.flatMap((line, index) => {
+    const match = line.trim().match(/^URL:\s*(https?:\/\/\S+)$/i);
+    if (!match) return [];
+    return [{ title: lines[index - 1]?.trim().replace(/^\d+\.\s*/, "") || lines[index + 1]?.trim().replace(/^Title:\s*/i, "") || new URL(match[1]).hostname, url: match[1] }];
+  });
+}
+
 function toTranscript(messages: Message[]) {
   return messages
     .filter((message) => message.role === "user" || message.role === "assistant" || message.role === "system")
@@ -200,11 +287,15 @@ function toTranscript(messages: Message[]) {
     .map<LocalTranscriptMessage>((message) => ({
       id: message.id,
       role: message.role,
-      text: message.text,
+      text: limitText([message.text, message.contextText].filter(Boolean).join("\n\n"), MAX_CURRENT_INPUT_CHARS),
       timestamp: message.timestamp,
       backendId: message.backendId,
       modelId: message.modelId,
     }));
+}
+
+function transcriptTextLength(message: Message | LocalTranscriptMessage) {
+  return [message.text, "contextText" in message ? message.contextText : ""].filter(Boolean).join("\n\n").length;
 }
 
 function trimTranscript(messages: Message[]) {
@@ -213,22 +304,42 @@ function trimTranscript(messages: Message[]) {
   const kept: Message[] = [];
   for (let index = filtered.length - 1; index >= 0; index -= 1) {
     const message = filtered[index];
-    totalChars += message.text.length;
-    if (kept.length >= 32 || totalChars > 12_000) break;
+    const nextTotal = totalChars + transcriptTextLength(message);
+    if (kept.length >= MAX_TRANSCRIPT_MESSAGES || nextTotal > MAX_TRANSCRIPT_CHARS) break;
+    totalChars = nextTotal;
     kept.unshift(message);
   }
   return toTranscript(kept);
 }
 
-function normalizeText(value: string) {
-  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+function packTranscriptForLocal(transcript: LocalTranscriptMessage[]) {
+  let remaining = MAX_TRANSCRIPT_CHARS;
+  const systemMessages: LocalTranscriptMessage[] = [];
+  const recentMessages: LocalTranscriptMessage[] = [];
+
+  for (const message of transcript) {
+    if (message.role !== "system" || remaining <= 0) continue;
+    const text = limitText(message.text, Math.min(MAX_SYSTEM_MESSAGE_CHARS, remaining));
+    if (!text) continue;
+    systemMessages.push({ ...message, text });
+    remaining -= text.length;
+  }
+
+  for (let index = transcript.length - 1; index >= 0 && remaining > 0; index -= 1) {
+    const message = transcript[index];
+    if (message.role === "system") continue;
+    const text = limitText(message.text, Math.min(MAX_CURRENT_INPUT_CHARS, remaining));
+    if (!text) continue;
+    recentMessages.unshift({ ...message, text });
+    remaining -= text.length;
+    if (recentMessages.length >= MAX_TRANSCRIPT_MESSAGES) break;
+  }
+
+  return [...systemMessages, ...recentMessages];
 }
 
-function deriveContextHealth(messages: Message[]) {
-  const totalChars = messages.reduce((sum, message) => sum + message.text.length, 0);
-  if (totalChars > 10_000 || messages.length > 24) return "Dense";
-  if (totalChars > 4_000 || messages.length > 12) return "Warm";
-  return "Fresh";
+function normalizeText(value: string) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
 function buildDeviceContextMessage(profile: DeviceProfile | null, ownerName: string, batteryCutoff: number): LocalTranscriptMessage | null {
@@ -326,6 +437,10 @@ function buildDirectDeviceReply(input: string, profile: DeviceProfile | null, ow
 function cleanupAssistantDisplayText(text: string) {
   if (!text.trim()) return text;
 
+  if (/```|`[^`]+`|\*\*[^*]+\*\*|^#{1,3}\s|^[-*]\s/m.test(text)) {
+    return text.trim();
+  }
+
   const withoutMarkdown = text
     .replace(/```/g, "")
     .replace(/\*\*/g, "")
@@ -362,6 +477,31 @@ function cleanupAssistantDisplayText(text: string) {
   }
 
   return collapsed.join(" ").replace(/\s{2,}/g, " ").trim();
+}
+
+function renderInlineMarkdown(text: string) {
+  return text.split(/(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^)]+\))/g).map((part, index) => {
+    if (part.startsWith("`") && part.endsWith("`")) return <code key={index} className="rounded bg-black/60 px-1 py-0.5 text-lime-200">{part.slice(1, -1)}</code>;
+    if (part.startsWith("**") && part.endsWith("**")) return <strong key={index}>{part.slice(2, -2)}</strong>;
+    const link = part.match(/^\[([^\]]+)\]\((https?:\/\/[^)]+)\)$/);
+    if (link) return <a key={index} href={link[2]} target="_blank" rel="noreferrer" className="text-cyan-300 underline">{link[1]}</a>;
+    return part;
+  });
+}
+
+function AssistantContent({ text }: { text: string }) {
+  const blocks = text.split(/```/);
+  return <div className="space-y-2 break-words">{blocks.map((block, index) => {
+    if (index % 2 === 1) {
+      const [language, ...code] = block.replace(/^\n/, "").split("\n");
+      return <pre key={index} className="overflow-x-auto rounded-md bg-black p-3 text-xs text-lime-200"><code>{code.length ? code.join("\n") : language}</code></pre>;
+    }
+    return block.split("\n").filter((line, lineIndex, lines) => line || (lineIndex > 0 && lines[lineIndex - 1])).map((line, lineIndex) => {
+      if (/^#{1,3}\s/.test(line)) return <h3 key={`${index}-${lineIndex}`} className="font-bold text-white">{renderInlineMarkdown(line.replace(/^#{1,3}\s+/, ""))}</h3>;
+      if (/^[-*]\s/.test(line)) return <div key={`${index}-${lineIndex}`} className="flex gap-2"><span>•</span><span>{renderInlineMarkdown(line.slice(2))}</span></div>;
+      return <p key={`${index}-${lineIndex}`} className="whitespace-pre-wrap">{renderInlineMarkdown(line)}</p>;
+    });
+  })}</div>;
 }
 
 function trustStateLabel(trustState: HiveTrustState) {
@@ -401,13 +541,30 @@ export default function App() {
   const [ownerNameAutoDetected, setOwnerNameAutoDetected] = useState("");
   const [developerMode, setDeveloperMode] = useState(() => readStoredJson<boolean>(DEV_MODE_STORAGE_KEY, false));
   const [preferredBackendPolicy, setPreferredBackendPolicy] = useState<BackendPolicy>(() => readStoredJson<BackendPolicy>(BACKEND_POLICY_KEY, "auto"));
-  const [preferredModelId, setPreferredModelId] = useState(() => readStoredJson<string>(PREFERRED_MODEL_KEY, "qwen2.5-0.5b-instruct"));
+  const [preferredModelId, setPreferredModelId] = useState(() => readStoredJson<string>(PREFERRED_MODEL_KEY, "qwen2.5-1.5b-instruct-litert"));
   const [soakTestRunning, setSoakTestRunning] = useState(false);
   const [soakTestResult, setSoakTestResult] = useState<SoakTestResult | null>(null);
   const [agentToolsEnabled, setAgentToolsEnabled] = useState(() => readStoredJson<boolean>(AGENT_TOOLS_STORAGE_KEY, true));
   const [allowMeteredWebSearch, setAllowMeteredWebSearch] = useState(() => readStoredJson<boolean>(ALLOW_METERED_WEB_STORAGE_KEY, true));
+  const [searchMode, setSearchMode] = useState<SearchMode>(() => readStoredJson<SearchMode>(SEARCH_MODE_STORAGE_KEY, "auto"));
+  const [memories, setMemories] = useState<MemoryRecord[]>(() => readStoredJson<MemoryRecord[]>(MEMORY_STORAGE_KEY, []));
+  const [memoryEnabled, setMemoryEnabled] = useState(() => readStoredJson<boolean>(MEMORY_ENABLED_STORAGE_KEY, true));
+  const [branches, setBranches] = useState<ChatBranch[]>(() => readStoredJson<ChatBranch[]>(BRANCH_STORAGE_KEY, []));
+  const [temporaryChat, setTemporaryChat] = useState(() => readStoredJson<boolean>(TEMPORARY_CHAT_STORAGE_KEY, false));
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([]);
+  const [voiceListening, setVoiceListening] = useState(false);
+  const [toolCapability, setToolCapability] = useState<"unknown" | "checking" | "capable" | "unreliable">("unknown");
   const [lastAgentToolTrace, setLastAgentToolTrace] = useState<ToolActivityEntry[]>([]);
   const agentAbortControllerRef = useRef<AbortController | null>(null);
+  const autoRestoreStartedRef = useRef(false);
+  const secureChatHydratedRef = useRef(false);
+  const secureUserDataHydratedRef = useRef(false);
+  const nativeToolContextRef = useRef({
+    allowWebSearch: true,
+    allowPrivateHosts: false,
+    device: { profile: null as DeviceProfile | null, ownerName: "", batteryCutoff: 20 },
+    hive: { apiBase: API_BASE, activeRoute: null as { host: string; hiveInfoUrl: string; ollamaUrl: string } | null },
+  });
   const [routes, setRoutes] = useState<HiveRoute[]>([]);
   const [activeRoute, setActiveRoute] = useState<HiveRoute | null>(null);
   const [hiveProbe, setHiveProbe] = useState<HiveProbeResult | null>(null);
@@ -453,14 +610,66 @@ export default function App() {
     [models, preferredModelId],
   );
   const loadedModel = useMemo(() => models.find((model) => model.loaded) ?? null, [models]);
-  const activeBackend = useMemo(() => backends.find((backend) => backend.id === loadedModel?.backendId) ?? null, [backends, loadedModel]);
   const connectionLabel = loadedModel ? "Local" : hiveProbe?.status === "optimal" ? "Hive Connected" : "Offline";
   const batteryTooLow = profile?.batteryPercent !== undefined && profile.batteryPercent >= 0 && profile.batteryPercent < batteryCutoff && !profile.charging;
-  const contextHealth = deriveContextHealth(messages);
+
+  nativeToolContextRef.current = {
+    allowWebSearch: allowMeteredWebSearch && searchMode !== "local",
+    allowPrivateHosts: developerMode,
+    device: { profile, ownerName: ownerName.trim() || ownerNameAutoDetected.trim(), batteryCutoff },
+    hive: {
+      apiBase: API_BASE,
+      activeRoute: activeRoute ? { host: activeRoute.host, hiveInfoUrl: activeRoute.hiveInfoUrl, ollamaUrl: activeRoute.ollamaUrl } : null,
+    },
+  };
 
   useEffect(() => {
-    localStorage.setItem(CHAT_STORAGE_KEY, JSON.stringify(messages.filter((message) => message.status !== "streaming")));
-  }, [messages]);
+    if (!temporaryChat) {
+      const raw = JSON.stringify(messages.filter((message) => message.status !== "streaming"));
+      if (nativeAvailable) {
+        if (!secureChatHydratedRef.current) return;
+        void LocalLlm.saveSecureText({ key: "chat-history", value: raw });
+        localStorage.removeItem(CHAT_STORAGE_KEY);
+      } else {
+        localStorage.setItem(CHAT_STORAGE_KEY, raw);
+      }
+    }
+  }, [messages, temporaryChat, nativeAvailable]);
+
+  useEffect(() => {
+    if (!nativeAvailable || temporaryChat) return;
+    void LocalLlm.loadSecureText({ key: "chat-history" }).then((result) => {
+      if (!result.exists || !result.value) return;
+      const parsed = JSON.parse(result.value);
+      if (Array.isArray(parsed)) setMessages(parsed);
+    }).catch(() => setRuntimeError("Encrypted chat history could not be loaded.")).finally(() => { secureChatHydratedRef.current = true; });
+  }, [nativeAvailable, temporaryChat]);
+
+  useEffect(() => {
+    localStorage.setItem(SEARCH_MODE_STORAGE_KEY, JSON.stringify(searchMode));
+    localStorage.setItem(MEMORY_ENABLED_STORAGE_KEY, JSON.stringify(memoryEnabled));
+    localStorage.setItem(TEMPORARY_CHAT_STORAGE_KEY, JSON.stringify(temporaryChat));
+    if (nativeAvailable) {
+      if (!secureUserDataHydratedRef.current) return;
+      void LocalLlm.saveSecureText({ key: "chat-user-data", value: JSON.stringify({ memories, branches, memoryEnabled }) });
+      localStorage.removeItem(MEMORY_STORAGE_KEY);
+      localStorage.removeItem(BRANCH_STORAGE_KEY);
+    } else {
+      localStorage.setItem(MEMORY_STORAGE_KEY, JSON.stringify(memories));
+      localStorage.setItem(BRANCH_STORAGE_KEY, JSON.stringify(branches));
+    }
+  }, [searchMode, memories, branches, memoryEnabled, temporaryChat, nativeAvailable]);
+
+  useEffect(() => {
+    if (!nativeAvailable) return;
+    void LocalLlm.loadSecureText({ key: "chat-user-data" }).then((result) => {
+      if (!result.exists || !result.value) return;
+      const parsed = JSON.parse(result.value);
+      if (Array.isArray(parsed.memories)) setMemories(parsed.memories);
+      if (Array.isArray(parsed.branches)) setBranches(parsed.branches);
+      if (typeof parsed.memoryEnabled === "boolean") setMemoryEnabled(parsed.memoryEnabled);
+    }).catch(() => setRuntimeError("Encrypted memories could not be loaded.")).finally(() => { secureUserDataHydratedRef.current = true; });
+  }, [nativeAvailable]);
 
   useEffect(() => {
     localStorage.setItem(DEV_MODE_STORAGE_KEY, JSON.stringify(developerMode));
@@ -507,6 +716,8 @@ export default function App() {
     void LocalLlm.addListener("generationCancelled", handleGenerationCancelled).then((handle) => handles.push(handle));
     void LocalLlm.addListener("runtimeError", handleRuntimeError).then((handle) => handles.push(handle));
     void LocalLlm.addListener("backendSwitch", handleBackendSwitch).then((handle) => handles.push(handle));
+    void LocalLlm.addListener("voiceResult", handleVoiceResult).then((handle) => handles.push(handle));
+    void LocalLlm.addListener("nativeToolCall", handleNativeToolCall).then((handle) => handles.push(handle));
 
     return () => {
       clearPrimaryGenerationWatchdog();
@@ -522,6 +733,29 @@ export default function App() {
     setActiveTab("settings");
     void runSoakTest(launchArgs.modelId ?? recommendedModel?.id, launchArgs.backendId);
   }, [launchArgs, models, recommendedModel]);
+
+  useEffect(() => {
+    if (autoRestoreStartedRef.current || !runtimeStatus || models.length === 0) return;
+    autoRestoreStartedRef.current = true;
+    if (runtimeStatus.loaded) {
+      if (runtimeStatus.activeModelId) localStorage.setItem(LAST_LOADED_MODEL_KEY, JSON.stringify(runtimeStatus.activeModelId));
+      return;
+    }
+    const lastModelId = readStoredJson<string>(LAST_LOADED_MODEL_KEY, "");
+    const lastModel = models.find((model) => model.id === lastModelId && model.downloaded);
+    if (lastModel) void loadSelectedModel(lastModel).catch((error: any) => setRuntimeError(error?.message || "Unable to restore the last local model."));
+  }, [models, runtimeStatus]);
+
+  useEffect(() => {
+    if (!runtimeStatus?.loaded) {
+      setToolCapability("unknown");
+      return;
+    }
+    setToolCapability("checking");
+    void LocalLlm.checkToolCapability()
+      .then((result) => setToolCapability(result.capable ? "capable" : "unreliable"))
+      .catch(() => setToolCapability("unreliable"));
+  }, [runtimeStatus?.loaded, runtimeStatus?.activeModelId]);
 
   async function refreshLocalState() {
     try {
@@ -638,6 +872,39 @@ export default function App() {
     }
   }
 
+  function handleVoiceResult(event: VoiceResult) {
+    if (event.error) {
+      setRuntimeError(event.error);
+      setVoiceListening(false);
+      return;
+    }
+    if (event.text) setPrompt(event.text);
+    if (event.final) setVoiceListening(false);
+  }
+
+  async function handleNativeToolCall(event: NativeToolCallEvent) {
+    const startedMs = Date.now();
+    const label = toolActivityLabel(event.tool, event.args);
+    try {
+      const output = await executeTool(event.tool, event.args, nativeToolContextRef.current);
+      const entry: ToolActivityEntry = { tool: event.tool, label, ok: true, durationMs: Date.now() - startedMs };
+      const sources = sourcesFromToolOutput(output);
+      setLastAgentToolTrace((current) => [...current, entry]);
+      setMessages((current) => current.map((message) => message.status === "streaming"
+        ? { ...message, agentStatus: label, toolActivity: [...(message.toolActivity ?? []), entry], sources: [...(message.sources ?? []), ...sources.filter((source) => !(message.sources ?? []).some((existing) => existing.url === source.url))] }
+        : message));
+      await LocalLlm.resolveToolCall({ callId: event.callId, ok: true, output });
+    } catch (error: any) {
+      const detail = error?.message || "Tool execution failed.";
+      const entry: ToolActivityEntry = { tool: event.tool, label, ok: false, durationMs: Date.now() - startedMs, detail };
+      setLastAgentToolTrace((current) => [...current, entry]);
+      setMessages((current) => current.map((message) => message.status === "streaming"
+        ? { ...message, toolActivity: [...(message.toolActivity ?? []), entry] }
+        : message));
+      await LocalLlm.resolveToolCall({ callId: event.callId, ok: false, output: detail });
+    }
+  }
+
   function clearPrimaryGenerationWatchdog() {
     if (primaryGenerationStateRef.current.idleTimeoutId) {
       clearTimeout(primaryGenerationStateRef.current.idleTimeoutId);
@@ -690,7 +957,7 @@ export default function App() {
     }, PRIMARY_GENERATION_HARD_TIMEOUT_MS);
     primaryGenerationStateRef.current.idleTimeoutId = setTimeout(() => {
       completePrimaryGenerationFromWatchdog("idle");
-    }, PRIMARY_GENERATION_IDLE_TIMEOUT_MS);
+    }, PRIMARY_GENERATION_FIRST_TOKEN_TIMEOUT_MS);
   }
 
   function touchPrimaryGenerationWatchdog() {
@@ -801,10 +1068,99 @@ export default function App() {
     setRuntimeError("");
     await LocalLlm.loadModel({ modelId: model.id, backendId: model.backendId });
     await waitForModelLoad(model.id);
+    localStorage.setItem(LAST_LOADED_MODEL_KEY, JSON.stringify(model.id));
   }
 
-  async function sendMessage() {
-    const text = prompt.trim();
+  function snapshotBranch(label: string, source = messages) {
+    const stable = source.filter((message) => message.status !== "streaming");
+    if (stable.length === 0) return;
+    setBranches((current) => [{ id: `branch-${Date.now()}`, label, createdAt: new Date().toISOString(), messages: stable }, ...current].slice(0, 20));
+  }
+
+  function editMessage(messageId: string) {
+    const index = messages.findIndex((message) => message.id === messageId);
+    if (index < 0) return;
+    snapshotBranch("Before edit");
+    setPrompt(messages[index].text);
+    setMessages(messages.slice(0, index));
+  }
+
+  async function regenerateMessage(messageId: string) {
+    const index = messages.findIndex((message) => message.id === messageId);
+    if (index < 0) return;
+    const userIndex = messages.map((message) => message.role).lastIndexOf("user", index);
+    if (userIndex < 0) return;
+    const text = messages[userIndex].text;
+    const prior = messages.slice(0, userIndex);
+    snapshotBranch("Before regenerate");
+    setMessages(prior);
+    await sendMessage(text, prior);
+  }
+
+  function restoreBranch(branchId: string) {
+    const branch = branches.find((candidate) => candidate.id === branchId);
+    if (!branch) return;
+    snapshotBranch("Before branch switch");
+    setMessages(branch.messages);
+  }
+
+  async function addAttachments(fileList: FileList | null) {
+    if (!fileList) return;
+    try {
+      const next = await Promise.all([...fileList].slice(0, 3).map(readChatAttachment));
+      setAttachments((current) => {
+        const combined = [...current, ...next];
+        revokeAttachmentPreviews(combined.slice(3));
+        return combined.slice(0, 3);
+      });
+    } catch (error: any) {
+      setRuntimeError(error?.message || "Unable to read that attachment.");
+    }
+  }
+
+  function exportChat() {
+    const blob = new Blob([JSON.stringify({ exportedAt: new Date().toISOString(), messages, memories }, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `theorc-companion-${new Date().toISOString().slice(0, 10)}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+  }
+
+  async function changeTemporaryChat(enabled: boolean) {
+    if (enabled) {
+      setTemporaryChat(true);
+      setMessages([]);
+      return;
+    }
+    let restored: Message[] = [];
+    if (nativeAvailable) {
+      const result = await LocalLlm.loadSecureText({ key: "chat-history" });
+      if (result.exists && result.value) {
+        const parsed = JSON.parse(result.value);
+        if (Array.isArray(parsed)) restored = parsed;
+      }
+    } else {
+      restored = readStoredMessages();
+    }
+    setTemporaryChat(false);
+    setMessages(restored);
+  }
+
+  async function startVoiceInput() {
+    try {
+      setRuntimeError("");
+      setVoiceListening(true);
+      await LocalLlm.startVoiceInput();
+    } catch (error: any) {
+      setVoiceListening(false);
+      setRuntimeError(error?.message || "Voice input is unavailable.");
+    }
+  }
+
+  async function sendMessage(overrideText?: string, historyOverride?: Message[]) {
+    const text = (overrideText ?? prompt).trim();
     if (!text || isGenerating) return;
     const directDeviceReply = await maybeResolveDirectDeviceReply(text);
     if (directDeviceReply) {
@@ -835,7 +1191,16 @@ export default function App() {
       setRuntimeError("Load a local model for open-ended chat. Device questions like time, date, battery, and name can work immediately.");
       return;
     }
-    const history = trimTranscript(messages);
+    const baseHistory = trimTranscript(historyOverride ?? messages);
+    const approvedMemory = memoryEnabled ? memoryContext(memories) : null;
+    const history = approvedMemory ? [approvedMemory, ...baseHistory] : baseHistory;
+    const currentAttachments = overrideText ? [] : attachments;
+    const attachmentText = attachmentContext(currentAttachments);
+    const agentInput = limitText([
+      searchMode === "search" ? "Search the web before answering and cite the returned sources." : "",
+      text,
+      attachmentText,
+    ].filter(Boolean).join("\n\n"), MAX_CURRENT_INPUT_CHARS);
     const resolvedOwnerName = ownerName.trim() || ownerNameAutoDetected.trim();
     const deviceContext = buildDeviceContextMessage(profile, resolvedOwnerName, batteryCutoff);
     const userMessage: Message = {
@@ -845,6 +1210,8 @@ export default function App() {
       timestamp: new Date().toISOString(),
       backendId: loadedModel.backendId,
       modelId: loadedModel.id,
+      attachments: currentAttachments.map(({ name, type, size }) => ({ name, type, size })),
+      contextText: attachmentText,
     };
     const assistantMessage: Message = {
       id: `assistant-${Date.now()}`,
@@ -858,18 +1225,37 @@ export default function App() {
     };
 
     setPrompt("");
+    setAttachments([]);
+    revokeAttachmentPreviews(currentAttachments);
     setRuntimeError("");
     setIsGenerating(true);
     setMessages((current) => [...current, userMessage, assistantMessage]);
 
-    if (agentToolsEnabled) {
+    if (agentToolsEnabled && searchMode !== "local" && toolCapability === "capable") {
+      armPrimaryGenerationWatchdog();
+      try {
+        await LocalLlm.startGeneration({
+          conversationId: PRIMARY_CONVERSATION_ID,
+          message: agentInput,
+          transcript: packTranscriptForLocal(deviceContext ? [deviceContext, ...history] : history),
+          modelId: loadedModel.id,
+          backendId: chooseBackendId(loadedModel.backendId),
+          options: { temperature: 0.5, topP: 0.9, nativeTools: true },
+        });
+      } catch (error: any) {
+        handleRuntimeError({ conversationId: PRIMARY_CONVERSATION_ID, message: error?.message || "Native tool generation failed." });
+      }
+      return;
+    }
+
+    if (agentToolsEnabled && searchMode !== "local") {
       agentAbortControllerRef.current = new AbortController();
       try {
         const result = await runAgentLoop({
-          userMessage: text,
+          userMessage: agentInput,
           transcript: history,
           deviceContext,
-          allowWebSearch: allowMeteredWebSearch,
+          allowWebSearch: allowMeteredWebSearch && searchMode !== "local",
           allowPrivateHosts: developerMode,
           signal: agentAbortControllerRef.current.signal,
           device: {
@@ -935,6 +1321,7 @@ export default function App() {
                 status: undefined,
                 agentStatus: undefined,
                 toolActivity: result.toolActivity.length ? result.toolActivity : message.toolActivity,
+                sources: result.sources.length ? result.sources : message.sources,
               }
             : message
         )));
@@ -957,8 +1344,8 @@ export default function App() {
     try {
       await LocalLlm.startGeneration({
         conversationId: PRIMARY_CONVERSATION_ID,
-        message: text,
-        transcript: deviceContext ? [deviceContext, ...history] : history,
+        message: agentInput,
+        transcript: packTranscriptForLocal(deviceContext ? [deviceContext, ...history] : history),
         modelId: loadedModel.id,
         backendId: chooseBackendId(loadedModel.backendId),
         options: { temperature: 0.7, topP: 0.9 },
@@ -1007,8 +1394,8 @@ export default function App() {
       try {
         await LocalLlm.startGeneration({
           conversationId,
-          message: input,
-          transcript,
+          message: limitText(input, MAX_CURRENT_INPUT_CHARS),
+          transcript: packTranscriptForLocal(transcript),
           modelId: model.id,
           backendId: chooseBackendId(model.backendId),
           options: { temperature, topP: 0.9 },
@@ -1267,7 +1654,14 @@ export default function App() {
   }
 
   async function runObserverDiagnostics(route = activeRoute) {
-    if (!route || !developerMode) return;
+    if (!developerMode) {
+      setHiveError("Enable Developer mode before running observer diagnostics.");
+      return;
+    }
+    if (!route) {
+      setHiveError("Select a HIVE route before running observer diagnostics.");
+      return;
+    }
     setHiveBusy(true);
     setHiveError("");
     try {
@@ -1433,28 +1827,42 @@ export default function App() {
         <section className="flex-1 px-4 py-4">
           {activeTab === "chat" && (
             <ChatScreen
-              nativeAvailable={nativeAvailable}
-              setupComplete={setupComplete}
               profile={profile}
-              activeBackend={activeBackend}
-              model={recommendedModel}
               loadedModel={loadedModel}
-              runtimeStatus={runtimeStatus}
-              downloadProgress={downloadProgress}
-              loadState={loadState}
               runtimeError={runtimeError}
               backendBanner={backendBanner}
               messages={messages}
               prompt={prompt}
               isGenerating={isGenerating}
               batteryTooLow={batteryTooLow}
-              contextHealth={contextHealth}
+              agentToolsEnabled={agentToolsEnabled}
+              searchMode={searchMode}
+              attachments={attachments}
+              branches={branches}
+              temporaryChat={temporaryChat}
+              voiceListening={voiceListening}
+              canLoadModel={Boolean(recommendedModel?.downloaded)}
               onPromptChange={setPrompt}
-              onDownload={downloadSelectedModel}
-              onLoad={loadSelectedModel}
               onSend={sendMessage}
               onStop={stopGeneration}
-              onClear={() => setMessages([])}
+              onClear={() => { setMessages([]); setAttachments((current) => { revokeAttachmentPreviews(current); return []; }); void LocalLlm.deleteSecureText({ key: "chat-history" }); localStorage.removeItem(CHAT_STORAGE_KEY); }}
+              onSearchMode={setSearchMode}
+              onAttachments={addAttachments}
+              onRemoveAttachment={(id) => setAttachments((current) => { revokeAttachmentPreviews(current.filter((attachment) => attachment.id === id)); return current.filter((attachment) => attachment.id !== id); })}
+              onEdit={editMessage}
+              onRegenerate={regenerateMessage}
+              onDelete={(id) => { snapshotBranch("Before delete"); setMessages((current) => current.filter((message) => message.id !== id)); }}
+              onCopy={(text) => void navigator.clipboard.writeText(text)}
+              onRemember={(text) => setMemories((current) => current.some((memory) => memory.text === text) ? current : [...current, { id: `memory-${Date.now()}`, text, createdAt: new Date().toISOString() }])}
+              onRestoreBranch={restoreBranch}
+              onRenameBranch={(id, label) => setBranches((current) => current.map((branch) => branch.id === id ? { ...branch, label } : branch))}
+              onDeleteBranch={(id) => setBranches((current) => current.filter((branch) => branch.id !== id))}
+              onTemporaryChat={(enabled) => void changeTemporaryChat(enabled)}
+              onLoadModel={() => recommendedModel?.downloaded ? void loadSelectedModel(recommendedModel) : setActiveTab("settings")}
+              onOpenSettings={() => setActiveTab("settings")}
+              onExport={exportChat}
+              onVoiceInput={voiceListening ? () => void LocalLlm.stopVoiceInput().finally(() => setVoiceListening(false)) : startVoiceInput}
+              onSpeak={(text) => void LocalLlm.speak({ text: cleanupAssistantDisplayText(text) })}
             />
           )}
           {activeTab === "hive" && (
@@ -1507,6 +1915,8 @@ export default function App() {
           )}
           {activeTab === "settings" && (
             <SettingsScreen
+              nativeAvailable={nativeAvailable}
+              setupComplete={setupComplete}
               profile={profile}
               backends={backends}
               models={models}
@@ -1525,20 +1935,34 @@ export default function App() {
               onAllowMeteredWebSearch={setAllowMeteredWebSearch}
               lastAgentToolTrace={lastAgentToolTrace}
               loadedModelId={loadedModel?.id ?? ""}
+              downloadProgress={downloadProgress}
+              loadState={loadState}
+              memories={memories}
+              memoryEnabled={memoryEnabled}
+              temporaryChat={temporaryChat}
+              onMemoryChange={(id, text) => setMemories((current) => current.map((memory) => memory.id === id ? { ...memory, text } : memory))}
+              onMemoryDelete={(id) => setMemories((current) => current.filter((memory) => memory.id !== id))}
+              onClearMemories={() => setMemories([])}
+              onMemoryEnabled={setMemoryEnabled}
+              onTemporaryChat={(enabled) => void changeTemporaryChat(enabled)}
               onBatteryCutoff={setBatteryCutoff}
               onOwnerName={setOwnerName}
               onRequestContactsAccess={() => void requestContactsAccess()}
               onDeveloperMode={setDeveloperMode}
               onPreferredBackendPolicy={setPreferredBackendPolicy}
               onPreferredModelId={setPreferredModelId}
+              onDownload={(model) => void downloadSelectedModel(model)}
+              onLoad={(model) => void loadSelectedModel(model)}
               onRefresh={refreshLocalState}
               onRunSoakTest={() => void runSoakTest()}
               onDeleteModel={async (modelId) => {
                 await LocalLlm.deleteModel({ modelId });
+                if (readStoredJson<string>(LAST_LOADED_MODEL_KEY, "") === modelId) localStorage.removeItem(LAST_LOADED_MODEL_KEY);
                 await refreshLocalState();
               }}
               onUnload={async () => {
                 await LocalLlm.unloadModel();
+                localStorage.removeItem(LAST_LOADED_MODEL_KEY);
                 await refreshLocalState();
               }}
             />
@@ -1571,32 +1995,57 @@ function NavButton({ active, icon, label, onClick }: { active: boolean; icon: Re
 }
 
 function ChatScreen(props: {
-  nativeAvailable: boolean;
-  setupComplete: boolean;
   profile: DeviceProfile | null;
-  activeBackend: BackendRecord | null;
-  model: LocalModelRecord | null;
   loadedModel: LocalModelRecord | null;
-  runtimeStatus: RuntimeStatus | null;
-  downloadProgress: DownloadProgress | null;
-  loadState: ModelLoadState | null;
   runtimeError: string;
   backendBanner: string;
   messages: Message[];
   prompt: string;
   isGenerating: boolean;
   batteryTooLow: boolean;
-  contextHealth: string;
   onPromptChange: (value: string) => void;
-  onDownload: (model?: LocalModelRecord | null) => void;
-  onLoad: (model?: LocalModelRecord | null) => void;
   onSend: () => void;
   onStop: () => void;
   onClear: () => void;
+  agentToolsEnabled: boolean;
+  searchMode: SearchMode;
+  attachments: ChatAttachment[];
+  branches: ChatBranch[];
+  temporaryChat: boolean;
+  voiceListening: boolean;
+  canLoadModel: boolean;
+  onSearchMode: (mode: SearchMode) => void;
+  onAttachments: (files: FileList | null) => void;
+  onRemoveAttachment: (id: string) => void;
+  onEdit: (id: string) => void;
+  onRegenerate: (id: string) => void;
+  onDelete: (id: string) => void;
+  onCopy: (text: string) => void;
+  onRemember: (text: string) => void;
+  onRestoreBranch: (id: string) => void;
+  onRenameBranch: (id: string, label: string) => void;
+  onDeleteBranch: (id: string) => void;
+  onTemporaryChat: (enabled: boolean) => void;
+  onLoadModel: () => void;
+  onOpenSettings: () => void;
+  onExport: () => void;
+  onVoiceInput: () => void;
+  onSpeak: (text: string) => void;
 }) {
-  const needsSetup = !props.setupComplete || !props.loadedModel;
   const messageListRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState("");
+  const [feedback, setFeedback] = useState<Record<string, "up" | "down">>({});
+  const suggestions = props.attachments.length > 0
+    ? ["Summarize the attachment", "List the key points", "Find action items", "Explain the document simply"]
+    : ["Help me think through an idea", "Explain something complex simply", "Plan my next steps", "Draft a concise message"];
+
+  function copyMessage(message: Message) {
+    props.onCopy(message.text);
+    setCopiedMessageId(message.id);
+    window.setTimeout(() => setCopiedMessageId((current) => current === message.id ? "" : current), 1500);
+  }
 
   useEffect(() => {
     const container = messageListRef.current;
@@ -1612,47 +2061,31 @@ function ChatScreen(props: {
   }, [props.prompt]);
 
   return (
-    <div className="flex min-h-[calc(100vh-9rem)] flex-col gap-4">
-      {needsSetup && (
-        <section className="rounded-md border border-lime-400/30 bg-[#071007] p-4">
-          <div className="mb-4 flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-lg font-black">Local chat setup</h2>
-              <p className="mt-1 text-sm text-zinc-400">Install one local model, load it on-device, and keep every chat on this phone.</p>
+    <div className="relative flex min-h-[calc(100vh-9rem)] flex-col gap-2">
+      {historyOpen && (
+        <div className="fixed inset-0 z-40 flex bg-black/70" onClick={() => setHistoryOpen(false)}>
+          <aside className="h-full w-[82%] max-w-sm overflow-y-auto border-r border-zinc-800 bg-[#050805] p-4" onClick={(event) => event.stopPropagation()}>
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="font-bold">Chat history</h2>
+              <button title="Close history" onClick={() => setHistoryOpen(false)} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><X className="h-4 w-4" /></button>
             </div>
-            <ShieldCheck className="h-6 w-6 text-lime-300" />
-          </div>
-          <div className="grid gap-2 text-sm">
-            <SetupRow label="Device" value={props.profile ? `${props.profile.manufacturer} ${props.profile.model}` : "Checking"} ok={Boolean(props.profile)} />
-            <SetupRow label="Native backend" value={props.nativeAvailable ? "Android bridge available" : "Open the Android app"} ok={props.nativeAvailable} />
-            <SetupRow label="Storage free" value={props.profile ? formatBytes(props.profile.storageFreeBytes) : "Checking"} ok={(props.profile?.storageFreeBytes ?? 0) > (props.model?.downloadSizeBytes ?? 1)} />
-            <SetupRow label="Recommended model" value={props.model?.downloaded ? "Downloaded" : props.model?.name ?? "Checking"} ok={Boolean(props.model?.downloaded)} />
-          </div>
-          {props.downloadProgress && (
-            <div className="mt-4">
-              <div className="mb-1 flex justify-between text-xs text-zinc-400">
-                <span>Downloading model</span>
-                <span>{Math.round(props.downloadProgress.progress * 100)}%</span>
-              </div>
-              <div className="h-2 overflow-hidden rounded bg-zinc-900">
-                <div className="h-full bg-lime-400" style={{ width: `${Math.min(100, props.downloadProgress.progress * 100)}%` }} />
-              </div>
+            <button onClick={() => setHistoryOpen(false)} className="mb-2 w-full rounded-md border border-lime-400/40 bg-lime-400/10 p-3 text-left text-sm font-bold text-lime-200">Current chat</button>
+            <div className="space-y-2">
+              {props.branches.map((branch) => (
+                <div key={branch.id} className="flex items-center gap-1 rounded-md border border-zinc-800 bg-black/40 p-1">
+                  <button onClick={() => { props.onRestoreBranch(branch.id); setHistoryOpen(false); }} className="min-w-0 flex-1 px-2 py-2 text-left">
+                    <span className="block truncate text-sm font-bold">{branch.label}</span>
+                    <span className="text-xs text-zinc-500">{new Date(branch.createdAt).toLocaleString()}</span>
+                  </button>
+                  <button title="Rename chat" onClick={() => { const label = window.prompt("Rename chat", branch.label)?.trim(); if (label) props.onRenameBranch(branch.id, label); }} className="rounded p-2 text-zinc-400 hover:bg-zinc-900"><Edit3 className="h-4 w-4" /></button>
+                  <button title="Delete chat" onClick={() => { if (window.confirm(`Delete ${branch.label}?`)) props.onDeleteBranch(branch.id); }} className="rounded p-2 text-zinc-400 hover:bg-zinc-900 hover:text-red-300"><Trash2 className="h-4 w-4" /></button>
+                </div>
+              ))}
+              {props.branches.length === 0 && <p className="py-6 text-center text-sm text-zinc-500">No saved chat branches yet.</p>}
             </div>
-          )}
-          <div className="mt-4 flex gap-2">
-            <button onClick={() => props.onDownload(props.model)} disabled={!props.model || props.model.downloaded} className="flex flex-1 items-center justify-center gap-2 rounded-md bg-lime-400 px-3 py-3 text-sm font-black text-black disabled:opacity-40">
-              <Download className="h-4 w-4" />
-              Download
-            </button>
-            <button onClick={() => props.onLoad(props.model)} disabled={!props.model?.downloaded} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-lime-400/40 px-3 py-3 text-sm font-black text-lime-200 disabled:opacity-40">
-              <Play className="h-4 w-4" />
-              Load
-            </button>
-          </div>
-          {props.loadState && <p className="mt-3 text-xs text-zinc-400">Model state: {props.loadState.phase}{props.loadState.backend ? ` (${props.loadState.backend})` : ""}</p>}
-        </section>
+          </aside>
+        </div>
       )}
-
       {props.backendBanner && (
         <div className="rounded-md border border-cyan-400/40 bg-cyan-950/20 p-3 text-sm text-cyan-100">{props.backendBanner}</div>
       )}
@@ -1663,42 +2096,92 @@ function ChatScreen(props: {
         <div className="rounded-md border border-amber-500/40 bg-amber-950/20 p-3 text-sm text-amber-100">Battery is below the local inference cutoff.</div>
       )}
 
-      <div className="grid gap-2 md:grid-cols-4">
-        <StatusChip icon={<Cpu className="h-4 w-4" />} label="Backend" value={props.loadedModel?.backend ?? props.activeBackend?.label ?? "Idle"} />
-        <StatusChip icon={<Sparkles className="h-4 w-4" />} label="Model" value={props.loadedModel?.name ?? "None"} />
-        <StatusChip icon={<Network className="h-4 w-4" />} label="Offline" value={props.loadedModel ? "Ready" : "Waiting"} />
-        <StatusChip icon={<ShieldCheck className="h-4 w-4" />} label="Context" value={props.runtimeStatus?.supportsMultiTurn ? `${props.contextHealth} / multi-turn` : `${props.contextHealth} / replayed`} />
-      </div>
-
-      <section className="flex flex-1 flex-col rounded-md border border-zinc-800 bg-[#050805]">
-        <div className="flex items-center justify-between border-b border-zinc-800 px-3 py-2">
-          <div>
-            <span className="text-sm font-bold">{props.loadedModel?.name ?? "No local model loaded"}</span>
-            <p className="text-xs text-zinc-500">
-              {props.profile?.batteryPercent && props.profile.batteryPercent >= 0
-                ? `Battery ${Math.round(props.profile.batteryPercent)}%${props.profile.charging ? " / charging" : ""}`
-                : "Battery unknown"}
-            </p>
+      <section className="flex min-h-0 flex-1 flex-col">
+        <div className="space-y-2 px-1 pb-2">
+          <div className="flex items-center justify-between gap-2">
+            <div className="min-w-0">
+              <p className="text-sm font-bold">New chat</p>
+              <p className="truncate text-xs text-zinc-500">{props.loadedModel?.name ?? "No local model loaded"}</p>
+            </div>
+            <div className="flex shrink-0 items-center gap-1">
+            <button onClick={() => setHistoryOpen(true)} title="Chat history" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><History className="h-4 w-4" /></button>
+            <button onClick={() => props.onTemporaryChat(!props.temporaryChat)} title="Temporary chat" className={`rounded-md p-2 ${props.temporaryChat ? "bg-amber-400 text-black" : "text-zinc-400 hover:bg-zinc-900"}`}>
+              <ShieldCheck className="h-4 w-4" />
+            </button>
+            <button onClick={props.onExport} title="Export chat" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><Download className="h-4 w-4" /></button>
+            <button onClick={props.onClear} title="Clear chat" className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900"><Trash2 className="h-4 w-4" /></button>
+            </div>
           </div>
-          <button onClick={props.onClear} className="rounded-md p-2 text-zinc-400 hover:bg-zinc-900">
-            <Trash2 className="h-4 w-4" />
-          </button>
+          <div className="grid grid-cols-3 rounded-md border border-zinc-800 bg-black p-1">
+            {(["local", "auto", "search"] as SearchMode[]).map((mode) => (
+              <button key={mode} onClick={() => props.onSearchMode(mode)} disabled={mode !== "local" && !props.agentToolsEnabled} className={`rounded px-2 py-2 text-xs font-bold capitalize disabled:opacity-40 ${props.searchMode === mode ? "bg-zinc-800 text-white" : "text-zinc-500"}`}>
+                {mode === "search" ? "Web" : mode}
+              </button>
+            ))}
+          </div>
         </div>
-        <div ref={messageListRef} className="flex min-h-80 flex-1 flex-col gap-4 overflow-y-auto p-3">
-          {props.messages.length === 0 ? (
-            <div className="m-auto max-w-sm text-center text-sm text-zinc-500">Once the local model is loaded, this becomes a private, persistent, offline chat thread.</div>
+        <div ref={messageListRef} className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto px-1 py-3">
+          {props.messages.length === 0 && !props.loadedModel ? (
+            <div className="m-auto w-full max-w-md px-4 py-8 text-center">
+              <img src={companionIcon} alt="" className="mx-auto h-14 w-14 rounded-md border border-lime-400/30" />
+              <h2 className="mt-5 text-xl font-semibold">Load a local model to start</h2>
+              <p className="mt-2 text-sm text-zinc-500">Chat runs privately on this phone.</p>
+              <div className="mt-5 grid grid-cols-2 gap-2">
+                <button onClick={props.onLoadModel} disabled={!props.canLoadModel} className="rounded-md bg-lime-400 px-4 py-3 text-sm font-black text-black disabled:opacity-40">Load model</button>
+                <button onClick={props.onOpenSettings} className="rounded-md border border-zinc-700 px-4 py-3 text-sm font-bold">Open settings</button>
+              </div>
+            </div>
+          ) : props.messages.length === 0 ? (
+            <div className="m-auto w-full max-w-xl px-2 py-8 text-center">
+              <img src={companionIcon} alt="" className="mx-auto h-14 w-14 rounded-2xl border border-lime-400/30" />
+              <h2 className="mt-5 text-2xl font-semibold text-zinc-100">How can I help?</h2>
+              <p className="mt-2 text-sm text-zinc-500">Private, local conversation on this device.</p>
+              <div className="mt-7 grid grid-cols-2 gap-2 text-left">
+                {suggestions.map((suggestion) => (
+                  <button key={suggestion} onClick={() => props.onPromptChange(suggestion)} className="rounded-md border border-zinc-800 bg-zinc-950/60 px-4 py-3 text-sm text-zinc-300 hover:border-zinc-600 hover:bg-zinc-900">
+                    {suggestion}
+                  </button>
+                ))}
+              </div>
+            </div>
           ) : props.messages.map((message) => (
             <article key={message.id} className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}>
               <div className={`max-w-[92%] rounded-2xl px-4 py-3 text-[15px] leading-6 shadow-sm ${message.role === "user" ? "bg-lime-400 text-black" : message.status === "error" ? "border border-red-500/40 bg-red-950/40 text-red-100" : "border border-zinc-800 bg-zinc-950 text-zinc-100"}`}>
                 <p className={`mb-2 text-[11px] font-bold uppercase tracking-[0.18em] ${message.role === "user" ? "text-black/60" : "text-zinc-500"}`}>
                   {message.role === "user" ? "You" : message.status === "error" ? "Error" : "Companion"}
                 </p>
-                <div className="break-words whitespace-pre-wrap">
-                  {(message.role === "assistant" ? cleanupAssistantDisplayText(message.text) : message.text) || (message.status === "streaming" ? (message.agentStatus ?? "Thinking...") : "")}
+                {message.status === "streaming" && <p className="mb-2 text-xs font-bold text-lime-300">{message.agentStatus ?? "Thinking..."}</p>}
+                <div className="break-words">
+                  {message.role === "assistant" ? <AssistantContent text={cleanupAssistantDisplayText(message.text)} /> : <p className="whitespace-pre-wrap">{message.text}</p>}
                   {message.status === "streaming" && (
                     <span className="ml-1 inline-block h-4 w-2 animate-pulse rounded-sm bg-lime-300/80 align-middle" />
                   )}
                 </div>
+                {message.attachments && message.attachments.length > 0 && (
+                  <div className="mt-3 flex flex-wrap gap-1 text-xs opacity-70">
+                    {message.attachments.map((attachment) => <span key={attachment.name} className="rounded border border-current/20 px-2 py-1">{attachment.name}</span>)}
+                  </div>
+                )}
+                {!message.status && (
+                  <div className={`mt-3 flex flex-wrap gap-1 border-t pt-2 ${message.role === "user" ? "border-black/20" : "border-zinc-800"}`}>
+                    <button title={copiedMessageId === message.id ? "Copied" : "Copy"} onClick={() => copyMessage(message)} className="rounded p-1.5 opacity-70 hover:opacity-100">{copiedMessageId === message.id ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}</button>
+                    {message.role === "user" && <button title="Edit and branch" onClick={() => props.onEdit(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Edit3 className="h-3.5 w-3.5" /></button>}
+                    {message.role === "user" && <button title="Remember this" onClick={() => props.onRemember(message.text)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Sparkles className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Good response" aria-pressed={feedback[message.id] === "up"} onClick={() => setFeedback((current) => ({ ...current, [message.id]: "up" }))} className={`rounded p-1.5 opacity-70 hover:opacity-100 ${feedback[message.id] === "up" ? "text-lime-300 opacity-100" : ""}`}><ThumbsUp className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Bad response" aria-pressed={feedback[message.id] === "down"} onClick={() => setFeedback((current) => ({ ...current, [message.id]: "down" }))} className={`rounded p-1.5 opacity-70 hover:opacity-100 ${feedback[message.id] === "down" ? "text-red-300 opacity-100" : ""}`}><ThumbsDown className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Regenerate response" onClick={() => props.onRegenerate(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><RefreshCw className="h-3.5 w-3.5" /></button>}
+                    {message.role === "assistant" && <button title="Read aloud" onClick={() => props.onSpeak(message.text)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Volume2 className="h-3.5 w-3.5" /></button>}
+                    <button title="Delete message" onClick={() => props.onDelete(message.id)} className="rounded p-1.5 opacity-70 hover:opacity-100"><Trash2 className="h-3.5 w-3.5" /></button>
+                  </div>
+                )}
+                {message.sources && message.sources.length > 0 && (
+                  <div className="mt-3 space-y-1 border-t border-zinc-800 pt-2 text-xs">
+                    <p className="font-bold text-zinc-400">Sources</p>
+                    {message.sources.map((source) => (
+                      <a key={source.url} href={source.url} target="_blank" rel="noreferrer" className="block truncate text-cyan-300 underline">{source.title}</a>
+                    ))}
+                  </div>
+                )}
                 {message.toolActivity && message.toolActivity.length > 0 && (
                   <details className="mt-3 rounded-md border border-zinc-800 bg-black/40 p-2 text-xs text-zinc-400">
                     <summary className="cursor-pointer font-bold text-zinc-300">Tool activity ({message.toolActivity.length})</summary>
@@ -1715,7 +2198,27 @@ function ChatScreen(props: {
             </article>
           ))}
         </div>
-        <div className="flex gap-2 border-t border-zinc-800 p-3">
+        {props.attachments.length > 0 && (
+          <div className="flex flex-wrap gap-2 px-1 pb-2">
+            {props.attachments.map((attachment) => (
+              <div key={attachment.id} className="flex max-w-full items-center gap-2 rounded-md border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-300">
+                {attachment.previewUrl && <img src={attachment.previewUrl} alt="" className="h-8 w-8 rounded object-cover" />}
+                <span className="truncate">{attachment.name}</span>
+                <button onClick={() => props.onRemoveAttachment(attachment.id)}><X className="h-3.5 w-3.5" /></button>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="rounded-2xl border border-zinc-700 bg-zinc-950 p-2 shadow-lg shadow-black/30 focus-within:border-zinc-500">
+          <div className="flex items-center gap-2 px-2 pb-1 text-[11px] text-zinc-500">
+            <span className={`rounded-full border px-2 py-0.5 ${props.loadedModel ? "border-lime-400/30 text-lime-300" : "border-zinc-700"}`}>{props.loadedModel ? `${props.loadedModel.name} · ${props.loadedModel.backend || "Ready"}` : "No model loaded"}</span>
+            {props.temporaryChat && <span>Temporary</span>}
+          </div>
+          <div className="flex gap-2">
+          <label title="Attach photo, text, or PDF" className="flex cursor-pointer items-center rounded-full px-2 text-zinc-400 hover:bg-zinc-900 hover:text-zinc-200">
+            <Paperclip className="h-5 w-5" />
+            <input type="file" accept="image/*,.txt,.md,.json,.csv,.pdf,text/*,application/pdf" multiple className="hidden" onChange={(event) => { props.onAttachments(event.target.files); event.currentTarget.value = ""; }} />
+          </label>
           <textarea
             ref={composerRef}
             value={props.prompt}
@@ -1727,33 +2230,25 @@ function ChatScreen(props: {
               }
             }}
             disabled={props.isGenerating}
-            placeholder={props.loadedModel ? "Ask the local model..." : "Ask about this device, or load a model for full chat"}
+            placeholder={props.loadedModel ? (props.agentToolsEnabled ? "Ask anything; the assistant can search the web and call tools." : "Ask the local model...") : "Ask about this device, or load a model for full chat"}
             rows={1}
-            className="min-h-[52px] max-h-40 min-w-0 flex-1 resize-none rounded-2xl border border-zinc-800 bg-black px-4 py-3 text-[15px] outline-none focus:border-lime-400 disabled:opacity-50"
+            className="min-h-[48px] max-h-40 min-w-0 flex-1 resize-none bg-transparent px-2 py-3 text-[15px] outline-none disabled:opacity-50"
           />
           {props.isGenerating ? (
-            <button onClick={props.onStop} className="rounded-2xl bg-red-500 px-4 text-black">
+            <button onClick={props.onStop} className="my-1 rounded-full bg-red-500 px-3 text-black">
               <Square className="h-5 w-5" />
             </button>
           ) : (
-            <button onClick={props.onSend} disabled={!props.prompt.trim() || props.batteryTooLow} className="rounded-2xl bg-lime-400 px-4 text-black disabled:opacity-40">
-              <Send className="h-5 w-5" />
-            </button>
+            <>
+              <button onClick={props.onVoiceInput} title="Voice input" className={`my-1 rounded-full px-3 ${props.voiceListening ? "bg-red-500 text-black" : "text-zinc-400 hover:bg-zinc-900"}`}><Mic className="h-5 w-5" /></button>
+              <button onClick={() => props.onSend()} disabled={!props.prompt.trim() || props.batteryTooLow} className="my-1 rounded-full bg-zinc-100 px-3 text-black disabled:bg-zinc-800 disabled:text-zinc-500">
+                <Send className="h-5 w-5" />
+              </button>
+            </>
           )}
+          </div>
         </div>
       </section>
-    </div>
-  );
-}
-
-function StatusChip({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
-  return (
-    <div className="rounded-md border border-zinc-800 bg-[#050805] px-3 py-2">
-      <div className="mb-1 flex items-center gap-2 text-xs uppercase tracking-[0.2em] text-zinc-500">
-        {icon}
-        <span>{label}</span>
-      </div>
-      <div className="text-sm font-bold text-zinc-100">{value}</div>
     </div>
   );
 }
@@ -1981,6 +2476,7 @@ function HiveScreen({ routes, activeRoute, probe, busy, error, knownPeers, obser
           ))}
         </div>
       </div>
+      {error && <div className="rounded-md border border-red-500/40 bg-red-950/20 p-3 text-sm text-red-200">{error}</div>}
       {developerMode && (
         <div className="rounded-md border border-cyan-400/20 bg-cyan-950/10 p-3">
           <div className="mb-3 flex items-center justify-between gap-2">
@@ -2054,7 +2550,48 @@ function JobsScreen({ jobs, organizePath, scrapeUrl, error, onOrganizePath, onSc
   );
 }
 
-function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, ownerNameAutoDetected, developerMode, preferredBackendPolicy, preferredModelId, activeRoute, soakTestRunning, soakTestResult, agentToolsEnabled, allowMeteredWebSearch, lastAgentToolTrace, loadedModelId, onBatteryCutoff, onOwnerName, onRequestContactsAccess, onDeveloperMode, onPreferredBackendPolicy, onPreferredModelId, onAgentToolsEnabled, onAllowMeteredWebSearch, onRefresh, onRunSoakTest, onDeleteModel, onUnload }: {
+function LocalChatSetupCard({ nativeAvailable, profile, model, downloadProgress, loadState, onDownload, onLoad }: {
+  nativeAvailable: boolean;
+  profile: DeviceProfile | null;
+  model?: LocalModelRecord;
+  downloadProgress: DownloadProgress | null;
+  loadState: ModelLoadState | null;
+  onDownload: (model: LocalModelRecord) => void;
+  onLoad: (model: LocalModelRecord) => void;
+}) {
+  return (
+    <section className="rounded-md border border-lime-400/30 bg-[#071007] p-4">
+      <div className="mb-4 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-black">Local chat setup</h2>
+          <p className="mt-1 text-sm text-zinc-400">Install one local model, load it on-device, and keep every chat on this phone.</p>
+        </div>
+        <ShieldCheck className="h-6 w-6 text-lime-300" />
+      </div>
+      <div className="grid gap-2 text-sm">
+        <SetupRow label="Device" value={profile ? `${profile.manufacturer} ${profile.model}` : "Checking"} ok={Boolean(profile)} />
+        <SetupRow label="Native backend" value={nativeAvailable ? "Android bridge available" : "Open the Android app"} ok={nativeAvailable} />
+        <SetupRow label="Storage free" value={profile ? formatBytes(profile.storageFreeBytes) : "Checking"} ok={(profile?.storageFreeBytes ?? 0) > (model?.downloadSizeBytes ?? 1)} />
+        <SetupRow label="Selected model" value={model?.downloaded ? "Downloaded" : model?.name ?? "Checking"} ok={Boolean(model?.downloaded)} />
+      </div>
+      {downloadProgress && (
+        <div className="mt-4">
+          <div className="mb-1 flex justify-between text-xs text-zinc-400"><span>Downloading model</span><span>{Math.round(downloadProgress.progress * 100)}%</span></div>
+          <div className="h-2 overflow-hidden rounded bg-zinc-900"><div className="h-full bg-lime-400" style={{ width: `${Math.min(100, downloadProgress.progress * 100)}%` }} /></div>
+        </div>
+      )}
+      <div className="mt-4 flex gap-2">
+        <button onClick={() => model && onDownload(model)} disabled={!model || model.downloaded} className="flex flex-1 items-center justify-center gap-2 rounded-md bg-lime-400 px-3 py-3 text-sm font-black text-black disabled:opacity-40"><Download className="h-4 w-4" />Download</button>
+        <button onClick={() => model && onLoad(model)} disabled={!model?.downloaded} className="flex flex-1 items-center justify-center gap-2 rounded-md border border-lime-400/40 px-3 py-3 text-sm font-black text-lime-200 disabled:opacity-40"><Play className="h-4 w-4" />Load</button>
+      </div>
+      {loadState && <p className="mt-3 text-xs text-zinc-400">Model state: {loadState.phase}{loadState.backend ? ` (${loadState.backend})` : ""}</p>}
+    </section>
+  );
+}
+
+function SettingsScreen({ nativeAvailable, setupComplete, profile, backends, models, batteryCutoff, ownerName, ownerNameAutoDetected, developerMode, preferredBackendPolicy, preferredModelId, activeRoute, soakTestRunning, soakTestResult, agentToolsEnabled, allowMeteredWebSearch, lastAgentToolTrace, loadedModelId, downloadProgress, loadState, memories, memoryEnabled, temporaryChat, onBatteryCutoff, onOwnerName, onRequestContactsAccess, onDeveloperMode, onPreferredBackendPolicy, onPreferredModelId, onDownload, onLoad, onAgentToolsEnabled, onAllowMeteredWebSearch, onMemoryChange, onMemoryDelete, onClearMemories, onMemoryEnabled, onTemporaryChat, onRefresh, onRunSoakTest, onDeleteModel, onUnload }: {
+  nativeAvailable: boolean;
+  setupComplete: boolean;
   profile: DeviceProfile | null;
   backends: BackendRecord[];
   models: LocalModelRecord[];
@@ -2071,14 +2608,26 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
   allowMeteredWebSearch: boolean;
   lastAgentToolTrace: ToolActivityEntry[];
   loadedModelId: string;
+  downloadProgress: DownloadProgress | null;
+  loadState: ModelLoadState | null;
+  memories: MemoryRecord[];
+  memoryEnabled: boolean;
+  temporaryChat: boolean;
   onBatteryCutoff: (value: number) => void;
   onOwnerName: (value: string) => void;
   onRequestContactsAccess: () => void;
   onDeveloperMode: (value: boolean) => void;
   onPreferredBackendPolicy: (value: BackendPolicy) => void;
   onPreferredModelId: (value: string) => void;
+  onDownload: (model: LocalModelRecord) => void;
+  onLoad: (model: LocalModelRecord) => void;
   onAgentToolsEnabled: (value: boolean) => void;
   onAllowMeteredWebSearch: (value: boolean) => void;
+  onMemoryChange: (id: string, text: string) => void;
+  onMemoryDelete: (id: string) => void;
+  onClearMemories: () => void;
+  onMemoryEnabled: (enabled: boolean) => void;
+  onTemporaryChat: (enabled: boolean) => void;
   onRefresh: () => void;
   onRunSoakTest: () => void;
   onDeleteModel: (modelId: string) => void;
@@ -2086,12 +2635,27 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
 }) {
   const storageUsed = models.reduce((sum, model) => sum + (model.downloaded ? model.bytes : 0), 0);
   const smallModelLoaded = loadedModelId.includes("0.6") || loadedModelId.includes("0_6");
+  const curatedModels = [...models].sort((left, right) => Number(right.rawBase) - Number(left.rawBase)
+    || Number(right.recommended) - Number(left.recommended)
+    || left.downloadSizeBytes - right.downloadSizeBytes);
+  const selectedModel = curatedModels.find((model) => model.id === preferredModelId) ?? curatedModels[0];
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-black">Settings</h2>
         <button onClick={onRefresh} className="rounded-md border border-zinc-800 p-2 text-zinc-300"><RefreshCw className="h-4 w-4" /></button>
       </div>
+      {(!setupComplete || !loadedModelId) && (
+        <LocalChatSetupCard
+          nativeAvailable={nativeAvailable}
+          profile={profile}
+          model={selectedModel}
+          downloadProgress={downloadProgress}
+          loadState={loadState}
+          onDownload={onDownload}
+          onLoad={onLoad}
+        />
+      )}
       <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
         <div className="flex items-center gap-2 text-sm font-bold"><HardDrive className="h-4 w-4 text-lime-300" /> Device</div>
         <p className="mt-2 text-sm text-zinc-400">{profile ? `${profile.manufacturer} ${profile.model}, Android ${profile.androidVersion}` : "Unknown device"}</p>
@@ -2129,6 +2693,29 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
         )}
       </div>
       <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
+        <div className="mb-2 flex items-center justify-between gap-2">
+          <div className="text-sm font-bold">Approved memories</div>
+          <div className="flex items-center gap-3">
+            <button onClick={() => onMemoryEnabled(!memoryEnabled)} className={memoryEnabled ? "text-xs text-lime-300" : "text-xs text-zinc-500"}>{memoryEnabled ? "Enabled" : "Disabled"}</button>
+            <button onClick={onClearMemories} disabled={memories.length === 0} className="text-xs text-red-300 disabled:opacity-30">Forget all</button>
+          </div>
+        </div>
+        <p className="mb-3 text-xs text-zinc-500">Only items you explicitly save are added to future chat context.</p>
+        {memories.length === 0 ? <p className="text-sm text-zinc-500">No saved memories.</p> : memories.map((memory) => (
+          <div key={memory.id} className="mb-2 flex gap-2 last:mb-0">
+            <input value={memory.text} onChange={(event) => onMemoryChange(memory.id, event.target.value)} className="min-w-0 flex-1 rounded-md border border-zinc-800 bg-black px-3 py-2 text-sm" />
+            <button onClick={() => onMemoryDelete(memory.id)} className="rounded-md border border-zinc-800 p-2 text-red-300"><Trash2 className="h-4 w-4" /></button>
+          </div>
+        ))}
+      </div>
+      <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
+        <div className="mb-2 text-sm font-bold">Chat privacy</div>
+        <p className="mb-3 text-xs text-zinc-500">Normal history is encrypted by Android storage. Temporary chat is never persisted.</p>
+        <button onClick={() => onTemporaryChat(!temporaryChat)} className={`w-full rounded-md border px-3 py-3 text-sm font-black ${temporaryChat ? "border-amber-400 bg-amber-400 text-black" : "border-zinc-800 text-zinc-300"}`}>
+          Temporary chat {temporaryChat ? "on" : "off"}
+        </button>
+      </div>
+      <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
         <div className="mb-2 text-sm font-bold">Backend policy</div>
         <div className="grid grid-cols-3 gap-2">
           {(["auto", "litert", "mlc"] as BackendPolicy[]).map((policy) => (
@@ -2161,25 +2748,50 @@ function SettingsScreen({ profile, backends, models, batteryCutoff, ownerName, o
         <input type="range" min="5" max="80" step="5" value={batteryCutoff} onChange={(event) => onBatteryCutoff(Number(event.target.value))} className="mt-3 w-full accent-lime-400" />
       </div>
       <div className="rounded-md border border-zinc-800 bg-[#050805] p-3">
-        <div className="mb-2 text-sm font-bold">Models</div>
-        {models.map((model) => (
-          <div key={model.id} className="border-t border-zinc-800 py-3 first:border-t-0">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <p className="font-bold">{model.name}</p>
-                <p className="text-xs text-zinc-500">{model.backendId} / {model.downloaded ? formatBytes(model.bytes) : "Not downloaded"} {model.loaded ? "/ loaded" : ""}</p>
+        <div className="mb-2 text-sm font-bold">Curated Android model downloader</div>
+        <p className="mb-3 text-xs text-zinc-500">Only public LiteRT-LM artifacts with verified sizes and SHA-256 hashes are listed. Raw base models sort first when available.</p>
+        <p className="mb-3 rounded-md border border-amber-400/20 bg-amber-950/20 p-2 text-xs text-amber-200">The verified Llama 3.2 1B raw artifact requires Hugging Face authentication, so it is intentionally excluded until secure token support is added.</p>
+        <label className="mb-3 block text-xs font-bold text-zinc-300" htmlFor="model-picker">Model</label>
+        <select
+          id="model-picker"
+          value={selectedModel?.id ?? ""}
+          onChange={(event) => onPreferredModelId(event.target.value)}
+          disabled={curatedModels.length === 0}
+          className="w-full rounded-md border border-zinc-800 bg-black px-3 py-3 text-sm text-zinc-100 outline-none focus:border-lime-400 disabled:opacity-40"
+        >
+          {curatedModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+        </select>
+        {selectedModel && (() => {
+          const model = selectedModel;
+          const insufficientRam = Boolean(profile?.totalRamBytes && profile.totalRamBytes < model.minimumRamBytes);
+          const insufficientStorage = Boolean(profile?.storageFreeBytes && profile.storageFreeBytes < model.downloadSizeBytes + 67_108_864);
+          const activeDownload = downloadProgress?.modelId === model.id;
+          return (
+          <div className="mt-3 border-t border-zinc-800 pt-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <p className="font-bold">{model.name}</p>
+                  {model.rawBase && <span className="rounded bg-fuchsia-400 px-2 py-0.5 text-[10px] font-black text-black">RAW BASE</span>}
+                  {model.recommended && <span className="rounded bg-lime-400 px-2 py-0.5 text-[10px] font-black text-black">RECOMMENDED</span>}
+                </div>
+                <p className="mt-1 text-xs text-cyan-300">{model.alignment}</p>
+                <p className="mt-1 text-xs text-zinc-400">{model.description}</p>
+                <p className="mt-2 text-xs text-zinc-500">Download {formatBytes(model.downloadSizeBytes)} · Suggested RAM {formatBytes(model.minimumRamBytes)} · SHA-256 verified</p>
+                {insufficientRam && <p className="mt-1 text-xs text-amber-300">This phone has less RAM than the suggested minimum.</p>}
+                {insufficientStorage && !model.downloaded && <p className="mt-1 text-xs text-red-300">Not enough free storage for this download.</p>}
+                {activeDownload && <div className="mt-2 h-1.5 overflow-hidden rounded bg-zinc-900"><div className="h-full bg-lime-400" style={{ width: `${Math.min(100, downloadProgress.progress * 100)}%` }} /></div>}
+                {loadState?.modelId === model.id && <p className="mt-1 text-xs text-zinc-500">State: {loadState.phase}</p>}
               </div>
-              <div className="flex items-center gap-2">
-                <button onClick={() => onPreferredModelId(model.id)} className={`rounded-md border px-3 py-2 text-xs font-bold ${preferredModelId === model.id ? "border-lime-400 text-lime-300" : "border-zinc-800 text-zinc-400"}`}>
-                  Preferred
-                </button>
-                <button onClick={() => onDeleteModel(model.id)} disabled={!model.downloaded} className="rounded-md border border-zinc-800 p-2 text-zinc-400 disabled:opacity-30">
-                  <Trash2 className="h-4 w-4" />
-                </button>
-              </div>
+              <span className="rounded-md border border-lime-400 px-2 py-2 text-xs font-bold text-lime-300">Preferred</span>
+            </div>
+            <div className="mt-3 grid grid-cols-[1fr_1fr_auto] gap-2">
+              <button onClick={() => onDownload(model)} disabled={model.downloaded || Boolean(downloadProgress) || insufficientStorage} className="rounded-md bg-lime-400 px-3 py-2 text-xs font-black text-black disabled:opacity-30">{activeDownload ? `${Math.round(downloadProgress.progress * 100)}%` : model.downloaded ? "Downloaded" : "Download"}</button>
+              <button onClick={() => onLoad(model)} disabled={!model.downloaded || model.loaded} className="rounded-md border border-lime-400/40 px-3 py-2 text-xs font-bold text-lime-200 disabled:opacity-30">{model.loaded ? "Loaded" : "Load"}</button>
+              <button onClick={() => onDeleteModel(model.id)} disabled={!model.downloaded || model.loaded} title="Delete model" className="rounded-md border border-zinc-800 p-2 text-zinc-400 disabled:opacity-30"><Trash2 className="h-4 w-4" /></button>
             </div>
           </div>
-        ))}
+        );})()}
         <button onClick={onUnload} className="mt-2 w-full rounded-md border border-zinc-800 px-3 py-2 text-sm font-bold text-zinc-300">Unload model</button>
       </div>
       <button onClick={() => onDeveloperMode(!developerMode)} className={`w-full rounded-md border px-3 py-3 text-sm font-black ${developerMode ? "border-lime-400 bg-lime-400 text-black" : "border-zinc-800 text-zinc-300"}`}>
