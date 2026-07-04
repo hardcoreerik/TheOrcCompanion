@@ -178,6 +178,7 @@ const WORKER_LANES_DEFAULT = ["researcher"];
 const SOAK_SCRIPT_ID = "linked-15-turn-memory";
 const AGENT_SOAK_PROMPT = "Use web_search to find the official Google LiteRT-LM Android documentation page, then give me one real URL from the results.";
 const API_BASE = ((import.meta as any).env?.VITE_API_BASE ?? "").replace(/\/$/, "");
+const PRIMARY_GENERATION_FIRST_TOKEN_TIMEOUT_MS = 30_000;
 const PRIMARY_GENERATION_IDLE_TIMEOUT_MS = 8_000;
 const PRIMARY_GENERATION_HARD_TIMEOUT_MS = 120_000;
 const MAX_ATTACHMENT_CHARS = 500;
@@ -952,7 +953,7 @@ export default function App() {
     }, PRIMARY_GENERATION_HARD_TIMEOUT_MS);
     primaryGenerationStateRef.current.idleTimeoutId = setTimeout(() => {
       completePrimaryGenerationFromWatchdog("idle");
-    }, PRIMARY_GENERATION_IDLE_TIMEOUT_MS);
+    }, PRIMARY_GENERATION_FIRST_TOKEN_TIMEOUT_MS);
   }
 
   function touchPrimaryGenerationWatchdog() {
