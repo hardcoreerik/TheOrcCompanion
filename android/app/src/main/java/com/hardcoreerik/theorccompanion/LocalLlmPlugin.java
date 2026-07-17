@@ -174,14 +174,14 @@ public class LocalLlmPlugin extends Plugin {
                 "faa60663b333290c1496c499828b21d3e3254a788cacd8cce917ce0f761a2dc9",
                 BACKEND_LITERT,
                 "Post-trained instruct",
-                "Best chat quality in the small curated set; slower and heavier than the 0.6B option.",
+                "Best chat quality in the small curated set; CPU-only on phones to avoid GPU memory pressure.",
                 4_294_967_296L,
                 false,
                 true,
                 false,
                 true,
                 true,
-                true,
+                false,
                 true,
                 1_597_931_520L
             )
@@ -1013,8 +1013,10 @@ public class LocalLlmPlugin extends Plugin {
 
     @PluginMethod
     public void unloadModel(PluginCall call) {
-        worker.submit(this::closeRuntime);
-        call.resolve(new JSObject().put("unloaded", true));
+        worker.submit(() -> {
+            closeRuntime();
+            call.resolve(new JSObject().put("unloaded", true));
+        });
     }
 
     @PluginMethod
