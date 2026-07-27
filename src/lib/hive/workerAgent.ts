@@ -10,6 +10,8 @@
 // this runs entirely as fetch calls from the WebView, so it works in a
 // packaged release APK exactly as it does in `npm run dev`.
 
+import { signedHiveHeaders } from "./controlClient";
+
 const POLL_INTERVAL_MS = 3_000;
 const HEARTBEAT_INTERVAL_MS = 10_000;
 
@@ -45,6 +47,10 @@ export interface WorkerAgentConfig {
 
 function baseUrl(url: string) {
   return url.replace(/\/+$/, "");
+}
+
+function hiveHost(url: string) {
+  return new URL(url).hostname;
 }
 
 export class HiveWorkerAgentClient {
@@ -115,8 +121,10 @@ export class HiveWorkerAgentClient {
 
   private async pollNextTask(signal: AbortSignal): Promise<HiveTaskBundle | null> {
     const lanes = this.config.lanes.length ? this.config.lanes.join(",") : "researcher,coder,uideveloper,tester";
-    const url = `${baseUrl(this.config.warchiefUrl)}/hive/tasks/next?lanes=${encodeURIComponent(lanes)}&workerId=${encodeURIComponent(this.config.workerId)}`;
-    const response = await fetch(url, { signal });
+    const path = "/hive/tasks/next";
+    const url = `${baseUrl(this.config.warchiefUrl)}${path}?lanes=${encodeURIComponent(lanes)}&workerId=${encodeURIComponent(this.config.workerId)}`;
+    const headers = await signedHiveHeaders(hiveHost(this.config.warchiefUrl), "GET", path);
+    const response = await fetch(url, { signal, headers });
     if (response.status === 204) return null;
     if (!response.ok) return null;
     return response.json();
@@ -173,10 +181,13 @@ export class HiveWorkerAgentClient {
 
   private async claimTask(bundle: HiveTaskBundle, signal: AbortSignal): Promise<string | null> {
     const url = `${baseUrl(this.config.warchiefUrl)}/hive/tasks/${bundle.taskId}/claim`;
+    const path = `/hive/tasks/${bundle.taskId}/claim`;
+    const body = JSON.stringify({ workerId: this.config.workerId, workerUrl: "", lanes: this.config.lanes });
+    const auth = await signedHiveHeaders(hiveHost(this.config.warchiefUrl), "POST", path, body);
     const response = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ workerId: this.config.workerId, workerUrl: "", lanes: this.config.lanes }),
+      headers: { "Content-Type": "application/json", ...auth },
+      body,
       signal,
     });
     if (!response.ok) return null;
@@ -187,10 +198,13 @@ export class HiveWorkerAgentClient {
   private async sendHeartbeat(bundle: HiveTaskBundle, claimToken: string) {
     try {
       const url = `${baseUrl(this.config.warchiefUrl)}/hive/tasks/${bundle.taskId}/heartbeat`;
+      const path = `/hive/tasks/${bundle.taskId}/heartbeat`;
+      const body = JSON.stringify({ workerId: this.config.workerId, claimToken });
+      const auth = await signedHiveHeaders(hiveHost(this.config.warchiefUrl), "POST", path, body);
       await fetch(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ workerId: this.config.workerId, claimToken }),
+        headers: { "Content-Type": "application/json", ...auth },
+        body,
       });
     } catch {
       // non-fatal — Warchief watchdog re-queues if heartbeats stop arriving
@@ -213,10 +227,13 @@ export class HiveWorkerAgentClient {
     signal: AbortSignal,
   ) {
     const url = `${baseUrl(this.config.warchiefUrl)}/hive/tasks/${bundle.taskId}/${action}`;
+    const path = `/hive/tasks/${bundle.taskId}/${action}`;
+    const body = JSON.stringify(result);
+    const auth = await signedHiveHeaders(hiveHost(this.config.warchiefUrl), "POST", path, body);
     await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(result),
+      headers: { "Content-Type": "application/json", ...auth },
+      body,
       signal,
     }).catch(() => undefined);
   }

@@ -143,6 +143,12 @@ The intended relationship is:
 
 This repo is the bridge between "phone UI for a demo" and "phone as a real member of the swarm."
 
+### Android HIVE control
+
+The packaged Android app can join through TheOrc's normal fingerprint-confirmed HIVE pairing flow. Its hardware-backed device identity signs worker traffic and remote task submissions, then follows HIVE results from the phone. Worker mode is enabled by default and can be turned off in the HIVE screen.
+
+The browser development build remains an observer dashboard. It does not receive pairing keys, remote-control authority, terminal access, or worker credentials.
+
 ---
 
 ## Quick Start

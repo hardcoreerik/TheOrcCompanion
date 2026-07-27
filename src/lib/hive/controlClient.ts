@@ -1,166 +1,166 @@
-// HIVE MIND remote-control client — companion → any HIVE node (including the
-// Warchief), talking to the node API's /hive/control/* surface on port 7078.
-//
-// Trust model matches OrchestratorIDE/Services/Hive/HiveControlAuth.cs:
-//   1. Pair once (POST /hive/control/pair) — node must have remote-control
-//      pairing enabled by the desktop user. Returns a shared secret.
-//   2. Every signed request carries:
-//        X-Hive-Peer:      <peerId>
-//        X-Hive-Timestamp: <ISO-8601 UTC>
-//        X-Hive-Signature: hex(HMAC-SHA256(secret, `${timestamp}.${rawBody}`))
-//
-// Secrets are stored per-host in localStorage — never sent anywhere except as
-// the HMAC key material consumed locally by Web Crypto.
+import { Capacitor, registerPlugin } from "@capacitor/core";
 
-const CONTROL_PORT = 7078;
-const SECRET_STORAGE_PREFIX = "orc-companion-hive-control-secret:";
-const PEER_ID_STORAGE_KEY = "orc-companion-hive-control-peer-id";
+const NODE_PORT = 7078;
+const TASK_PORT = 7079;
+const PEERS_KEY = "orc-companion-hive-peers";
+const hiveFetch = (input: RequestInfo | URL, init?: RequestInit) => fetch(input, { ...init, signal: AbortSignal.timeout(10_000) });
+
+interface HiveIdentityNative {
+  getIdentity(): Promise<{ nodeId: string; signingPublicKeyDer: string; exchangePublicKeyDer: string }>;
+  createPairingRequest(options: { name: string; vramMb?: number }): Promise<Record<string, unknown>>;
+  trustPeer(options: { nodeId: string; signingPublicKeyDer: string; exchangePublicKeyDer: string; hiveId?: string }): Promise<{ nodeId: string }>;
+  forgetPeer(options: { nodeId: string }): Promise<void>;
+  signRequest(options: { nodeId: string; method: string; path: string; body: string }): Promise<Record<string, string>>;
+}
+
+const HiveIdentity = registerPlugin<HiveIdentityNative>("HiveIdentity");
 
 export interface PairedNode {
   host: string;
-  secretHex: string;
+  nodeId: string;
   nodeName: string;
+  fingerprint: string;
   pairedAt: string;
 }
 
-export interface ControlStatusResponse {
-  nodeName: string;
-  info: { Name: string; Models: string[]; Lanes: string[]; VramFreeMb: number; VramTotalMb: number };
-  ollamaConfigured: boolean;
-  timestamp: string;
+export interface PendingPairing extends PairedNode {
+  signingPublicKeyDer: string;
+  exchangePublicKeyDer: string;
+  hiveId?: string;
 }
 
-export interface RunTaskResponse {
-  result: string;
-  model: string;
-  durationMs: number;
+export interface HiveTopologyNode {
+  nodeId: string;
+  name: string;
+  role: string;
+  state: "online" | "offline";
+  isMobile: boolean;
 }
 
-function controlUrl(host: string, path: string) {
-  return `http://${host}:${CONTROL_PORT}${path}`;
+export interface RemoteHiveTask {
+  host: string;
+  taskId: string;
+  spec: string;
+  status: string;
+  result?: string;
+  errorMsg?: string;
+  claimedBy?: string;
+  submittedAt: string;
 }
 
-function secretStorageKey(host: string) {
-  return `${SECRET_STORAGE_PREFIX}${host}`;
+function requireAndroid() {
+  if (Capacitor.getPlatform() !== "android") throw new Error("HIVE control is available in the Android app only.");
 }
 
-export function getCompanionPeerId(): string {
-  let peerId = localStorage.getItem(PEER_ID_STORAGE_KEY);
-  if (!peerId) {
-    peerId = `companion-${Math.random().toString(36).slice(2, 10)}-${Date.now().toString(36)}`;
-    localStorage.setItem(PEER_ID_STORAGE_KEY, peerId);
-  }
-  return peerId;
+function peers(): PairedNode[] {
+  try { return JSON.parse(localStorage.getItem(PEERS_KEY) || "[]"); } catch { return []; }
+}
+
+function savePeer(peer: PairedNode) {
+  localStorage.setItem(PEERS_KEY, JSON.stringify([...peers().filter((item) => item.host !== peer.host), peer]));
 }
 
 export function getPairedNode(host: string): PairedNode | null {
-  try {
-    const raw = localStorage.getItem(secretStorageKey(host));
-    return raw ? (JSON.parse(raw) as PairedNode) : null;
-  } catch {
-    return null;
-  }
+  return peers().find((peer) => peer.host === host) ?? null;
 }
 
-export function forgetPairedNode(host: string) {
-  localStorage.removeItem(secretStorageKey(host));
+export async function forgetPairedNode(host: string) {
+  const peer = getPairedNode(host);
+  if (peer) await HiveIdentity.forgetPeer({ nodeId: peer.nodeId });
+  localStorage.setItem(PEERS_KEY, JSON.stringify(peers().filter((item) => item.host !== host)));
 }
 
-function bytesToHex(bytes: ArrayBuffer | Uint8Array) {
-  const view = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
-  return Array.from(view).map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-function hexToBytes(hex: string) {
-  const out = new Uint8Array(hex.length / 2);
-  for (let i = 0; i < out.length; i += 1) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-  return out;
-}
-
-async function hmacSign(secretHex: string, message: string): Promise<string> {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    hexToBytes(secretHex),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(message));
-  return bytesToHex(signature);
-}
-
-async function signedHeaders(host: string, body: string) {
-  const paired = getPairedNode(host);
-  if (!paired) throw new Error(`Not paired with ${host}. Pair with this node first.`);
-  const timestamp = new Date().toISOString();
-  const signature = await hmacSign(paired.secretHex, `${timestamp}.${body}`);
-  return {
-    "Content-Type": "application/json",
-    "X-Hive-Peer": getCompanionPeerId(),
-    "X-Hive-Timestamp": timestamp,
-    "X-Hive-Signature": signature,
-  };
-}
-
-/**
- * Bootstraps trust with a node. The node must have
- * "Allow phone pairing" enabled locally by its desktop user, otherwise this
- * returns a 403. Stores the returned shared secret for this host.
- */
-export async function pairWithNode(host: string, label: string): Promise<PairedNode> {
-  const peerId = getCompanionPeerId();
-  const response = await fetch(controlUrl(host, "/hive/control/pair"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ peerId, label }),
+export async function pairWithNode(host: string, label: string): Promise<PendingPairing> {
+  requireAndroid();
+  const request = await HiveIdentity.createPairingRequest({ name: label });
+  const response = await hiveFetch(`http://${host}:${NODE_PORT}/hive/pair`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(request),
   });
-  if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.error || `Pairing failed with HTTP ${response.status}`);
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `Pairing failed with HTTP ${response.status}`);
+  const sessionId = String(request.sessionId);
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2_000));
+    const poll = await hiveFetch(`http://${host}:${NODE_PORT}/hive/pair/${sessionId}`);
+    const result = await poll.json();
+    if (result.status === "pending") continue;
+    if (result.status !== "approved") throw new Error(`Pairing ${result.status || "failed"}.`);
+    return {
+      host,
+      nodeId: result.warchiefNodeId,
+      nodeName: result.warchiefName,
+      fingerprint: result.warchiefFingerprint,
+      signingPublicKeyDer: result.warchiefSigningPublicKeyDer,
+      exchangePublicKeyDer: result.warchiefExchangePublicKeyDer,
+      hiveId: result.hiveId,
+      pairedAt: new Date().toISOString(),
+    };
   }
-  const data = await response.json();
-  const paired: PairedNode = {
-    host,
-    secretHex: data.secret,
-    nodeName: data.nodeName,
-    pairedAt: new Date().toISOString(),
-  };
-  localStorage.setItem(secretStorageKey(host), JSON.stringify(paired));
-  return paired;
+  throw new Error("Pairing approval timed out.");
 }
 
-export async function getControlStatus(host: string): Promise<ControlStatusResponse> {
-  const headers = await signedHeaders(host, "");
-  const response = await fetch(controlUrl(host, "/hive/control/status"), { headers });
-  if (!response.ok) {
-    const body = await response.json().catch(() => null);
-    throw new Error(body?.error || `Status check failed with HTTP ${response.status}`);
-  }
-  return response.json();
-}
-
-/**
- * Directly commands a paired node (including the Warchief) to run one
- * synchronous inference task with its own Ollama and return the result —
- * this is the "control the warchief from the phone" channel, as opposed to
- * the worker-agent loop where the node tasks the phone.
- */
-export async function runRemoteTask(
-  host: string,
-  spec: string,
-  role: string = "researcher",
-  modelHint?: string,
-): Promise<RunTaskResponse> {
-  const body = JSON.stringify({ spec, role, modelHint });
-  const headers = await signedHeaders(host, body);
-  const response = await fetch(controlUrl(host, "/hive/control/run-task"), {
-    method: "POST",
-    headers,
-    body,
+export async function confirmPairedNode(pending: PendingPairing): Promise<PairedNode> {
+  await HiveIdentity.trustPeer({
+    nodeId: pending.nodeId,
+    signingPublicKeyDer: pending.signingPublicKeyDer,
+    exchangePublicKeyDer: pending.exchangePublicKeyDer,
+    hiveId: pending.hiveId,
   });
-  if (!response.ok) {
-    const errBody = await response.json().catch(() => null);
-    throw new Error(errBody?.error || `Remote task failed with HTTP ${response.status}`);
-  }
-  return response.json();
+  const { signingPublicKeyDer: _signing, exchangePublicKeyDer: _exchange, hiveId: _hive, ...peer } = pending;
+  savePeer(peer);
+  return peer;
+}
+
+export async function signedHiveHeaders(host: string, method: string, path: string, body = "") {
+  requireAndroid();
+  const peer = getPairedNode(host);
+  if (!peer) throw new Error(`Not paired with ${host}.`);
+  return HiveIdentity.signRequest({ nodeId: peer.nodeId, method, path, body });
+}
+
+async function taskRequest<T>(host: string, method: string, path: string, value?: unknown): Promise<T> {
+  const body = value === undefined ? "" : JSON.stringify(value);
+  const headers = await signedHiveHeaders(host, method, path, body);
+  const response = await hiveFetch(`http://${host}:${TASK_PORT}${path}`, {
+    method,
+    headers: { ...headers, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body || undefined,
+  });
+  if (!response.ok) throw new Error((await response.json().catch(() => null))?.error || `HIVE request failed with HTTP ${response.status}`);
+  return response.json() as Promise<T>;
+}
+
+export async function getControlStatus(host: string) {
+  const response = await hiveFetch(`http://${host}:${NODE_PORT}/hive/info`);
+  if (!response.ok) throw new Error(`HIVE status failed with HTTP ${response.status}`);
+  const info = await response.json() as { Name: string; Models?: string[]; Lanes?: string[] };
+  const peer = getPairedNode(host);
+  const center: HiveTopologyNode = {
+    nodeId: peer?.nodeId ?? host,
+    name: info.Name,
+    role: "warchief",
+    state: "online",
+    isMobile: false,
+  };
+  return { nodeName: info.Name, info: { models: info.Models ?? [], lanes: info.Lanes ?? [] }, topology: { center, peers: [] } };
+}
+
+export async function getCompanionNodeId() {
+  requireAndroid();
+  return (await HiveIdentity.getIdentity()).nodeId;
+}
+
+export async function submitRemoteTask(host: string, spec: string): Promise<RemoteHiveTask> {
+  const submitted = await taskRequest<{ taskId: string }>(host, "POST", "/hive/tasks/submit", {
+    role: "Researcher",
+    title: spec.split("\n", 1)[0].slice(0, 80) || "Companion request",
+    spec,
+    projectGoal: "Requested remotely from TheOrc Companion",
+    timeoutMs: 300_000,
+  });
+  return { host, taskId: submitted.taskId, spec, status: "pending", submittedAt: new Date().toISOString() };
+}
+
+export async function getRemoteTask(task: RemoteHiveTask): Promise<RemoteHiveTask> {
+  const status = await taskRequest<Omit<RemoteHiveTask, "host" | "spec" | "submittedAt">>(task.host, "GET", `/hive/tasks/${task.taskId}`);
+  return { ...task, ...status };
 }
