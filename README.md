@@ -286,3 +286,9 @@ The desktop boss, HIVE design, and broader swarm runtime live here:
 [TheOrc](https://github.com/hardcoreerik/TheOrc)
 
 If TheOrc is the warboss, this repo is the scout, relay, and field terminal.
+
+## Support development
+
+If this project is useful to you, consider supporting its development. Across ORC projects, support helps fund development time, hardware testing, receiver compatibility, and decoder work.
+
+[GitHub Sponsors](https://github.com/sponsors/hardcoreerik) · [Ko-fi](https://ko-fi.com/hardcoreerik) · [PayPal](https://paypal.me/hardcoreerik)
